@@ -15,11 +15,11 @@ It never reads an OpenAI, Anthropic or other LLM API key.
   workspaces, keyed by the stable channel UUID;
 - a project chooser followed by one isolated history per project: switching
   projects replaces the entire timeline instead of filtering a global inbox;
-- complete channel-history pagination, live incremental refresh, and a thread
-  navigator filterable by agent, handoff, or media;
+- complete channel-history pagination on the project workspace, live incremental
+  refresh, and a thread navigator filterable by agent, handoff, or media;
 - a human-first Reader presentation that removes strict orchestration receipts,
   mass readback acknowledgements and internal paths while Operator preserves the
-  untouched Buzz events for audit;
+  reconciled operational conversation for audit;
 - readable Buzz thread timeline with Markdown, reply context, mentions, and
   exact event/thread references;
 - inline image galleries, native video, file cards, and full-screen image
@@ -30,16 +30,30 @@ It never reads an OpenAI, Anthropic or other LLM API key.
   receipts;
 - Reader and Operator modes, plus a project-level composer backed by one
   idempotent continuous-conversation mission per Buzz channel;
-- real managed-agent roster, configured model, presence signal and recent
-  response activity;
+- real managed-agent roster, configured model, presence signal and recent feed
+  activity;
 - focused Attention queue for blocks, decisions and explicit handoffs;
 - supervised handoff preparation that preserves parent dispatch and depth;
 - existing-thread linking by root event ID;
 - model-change drafts sent to the original Buzz Desktop for owner review.
 
-Attachments follow the media formats accepted by the installed Buzz CLI:
-JPEG, PNG, GIF, WebP, and MP4. The composer filters unsupported files before
-they reach the relay.
+The cockpit composer currently accepts JPEG, PNG, GIF, WebP, and MP4. It filters
+other files before they reach the relay; this is the cockpit allowlist, not a
+claim about every format the installed CLI may support.
+
+Mission threads currently use the CLI thread limit of 500 events; the complete
+backward pagination described above applies to the continuous project history.
+Buzz edit events (`kind 40003`) are folded into their target message before both
+Reader and Operator views, so Operator is not a raw protocol-event inspector.
+
+## Documentation
+
+- [Documentation index](./docs/README.md)
+- [Product and experience](./docs/PRODUCT.md)
+- [Technical architecture](./docs/ARCHITECTURE.md)
+- [Local operations](./docs/OPERATIONS.md)
+- [Implementation status](./docs/IMPLEMENTATION-STATUS.md)
+- [Product and engineering decisions](./docs/DECISIONS.md)
 
 ## Run locally
 
@@ -80,9 +94,10 @@ BUZZ_COCKPIT_STATE_PATH=/path/to/state.json
 ```
 
 Project-to-channel links, missions, conversation links, and visual loop state
-live in one local JSON file under the user's Application Support directory.
-Project names and descriptions remain user-owned after import. Messages,
-replies, files, presence, and profiles remain in Buzz.
+live in one local JSON file under the user's Application Support directory. A
+dispatch also retains its outbound prompt as local mission metadata. Project
+names and descriptions remain user-owned after import. Received events,
+replies, files, presence, and profiles remain canonical in Buzz.
 
 The adapter binds only to `127.0.0.1`, uses `spawn(..., { shell: false })`, and
 has no endpoint for arbitrary shell commands.
