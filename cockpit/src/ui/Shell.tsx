@@ -5,7 +5,6 @@ import {
   ChevronRight,
   FolderKanban,
   LayoutDashboard,
-  MessageSquareMore,
   RefreshCw,
 } from "lucide-react";
 import type { CockpitState } from "../domain";
@@ -17,14 +16,7 @@ export type CockpitMode = "reader" | "operator";
 export type MissionViewMode = "conversation" | "chain";
 
 export interface RouteDescriptor {
-  kind:
-    | "home"
-    | "activity"
-    | "project"
-    | "mission"
-    | "agents"
-    | "attention"
-    | "not-found";
+  kind: "home" | "project" | "mission" | "agents" | "attention" | "not-found";
   projectId?: string;
   missionId?: string;
 }
@@ -63,17 +55,6 @@ export function ProjectRail({
         >
           <LayoutDashboard size={15} aria-hidden="true" />
           Visão geral
-        </InternalLink>
-        <InternalLink
-          href="/activity"
-          className={
-            route.kind === "activity"
-              ? "rail-nav__item is-active"
-              : "rail-nav__item"
-          }
-        >
-          <MessageSquareMore size={15} aria-hidden="true" />
-          Atividade
         </InternalLink>
         <InternalLink
           href="/agents"
@@ -125,8 +106,14 @@ export function ProjectRail({
                   }
                 />
                 <span className="project-list__name">{project.name}</span>
-                <span className="project-list__count">
-                  {project.missionIds.length}
+                <span
+                  className={
+                    project.buzzChannelId
+                      ? "project-list__count project-list__count--live"
+                      : "project-list__count"
+                  }
+                >
+                  {project.buzzChannelId ? "live" : project.missionIds.length}
                 </span>
               </InternalLink>
             </li>
@@ -167,19 +154,21 @@ export function WorkspaceTopbar({
   const project = state.projects.find(
     (candidate) => candidate.id === route.projectId,
   );
-  const mission = state.missions.find(
+  const routeMission = state.missions.find(
     (candidate) => candidate.id === route.missionId,
   );
+  const mission =
+    project && routeMission?.projectId === project.id
+      ? routeMission
+      : undefined;
   const finalLabel =
     route.kind === "home"
       ? "Visão geral"
-      : route.kind === "activity"
-        ? "Atividade"
-        : route.kind === "agents"
-          ? "Agentes"
-          : route.kind === "attention"
-            ? "Atenção"
-            : (mission?.title ?? project?.name ?? "Página não encontrada");
+      : route.kind === "agents"
+        ? "Agentes"
+        : route.kind === "attention"
+          ? "Atenção"
+          : (mission?.title ?? project?.name ?? "Página não encontrada");
 
   return (
     <header className="workspace-topbar">

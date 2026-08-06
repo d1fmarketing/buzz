@@ -83,12 +83,19 @@ test("health redacts configuration and API routes dispatch fixed operations", as
       false,
     );
 
+    const channels = await request(port, "/api/channels/search?query=Methylia");
+    assert.equal(channels.status, 200);
+    assert.deepEqual(calls[0], {
+      operation: "channels:search",
+      input: { query: "Methylia" },
+    });
+
     const messages = await request(
       port,
       `/api/channels/${CHANNEL}/messages?limit=20&since=1`,
     );
     assert.equal(messages.status, 200);
-    assert.deepEqual(calls[0], {
+    assert.deepEqual(calls[1], {
       operation: "messages:get",
       input: { channelId: CHANNEL, limit: "20", since: "1", before: undefined },
     });
@@ -98,7 +105,7 @@ test("health redacts configuration and API routes dispatch fixed operations", as
       "/api/messages/search?query=checkout&author=Honey&limit=10",
     );
     assert.equal(search.status, 200);
-    assert.deepEqual(calls[1], {
+    assert.deepEqual(calls[2], {
       operation: "messages:search",
       input: {
         query: "checkout",
@@ -110,7 +117,7 @@ test("health redacts configuration and API routes dispatch fixed operations", as
 
     const channel = await request(port, `/api/channels/${CHANNEL}`);
     assert.equal(channel.status, 200);
-    assert.deepEqual(calls[2], {
+    assert.deepEqual(calls[3], {
       operation: "channels:get",
       input: { channelId: CHANNEL },
     });

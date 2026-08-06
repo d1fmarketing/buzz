@@ -2,6 +2,7 @@ import { copyDefaultLimits } from "./limits";
 import { cloneCockpitState, EMPTY_STATE, STARTER_STATE } from "./starter";
 import type {
   CockpitState,
+  ChannelSummary,
   Dispatch,
   DispatchReceipt,
   Mission,
@@ -59,6 +60,7 @@ export interface CreateProjectInput {
   name: string;
   description?: string;
   color?: string;
+  buzzChannelId?: string;
   now?: string;
 }
 
@@ -76,12 +78,22 @@ export function createProject(
   if (base.projects.some((project) => project.id === id)) {
     throw new Error(`Project ${id} already exists`);
   }
+  const buzzChannelId = input.buzzChannelId?.trim().toLowerCase();
+  if (
+    buzzChannelId &&
+    base.projects.some(
+      (project) => project.buzzChannelId?.toLowerCase() === buzzChannelId,
+    )
+  ) {
+    throw new Error(`Buzz channel ${buzzChannelId} is already linked`);
+  }
 
   const project: Project = {
     id,
     name,
     description: input.description?.trim() ?? "",
     color: input.color ?? "#D97757",
+    buzzChannelId: buzzChannelId || undefined,
     missionIds: [],
     createdAt: timestamp,
     updatedAt: timestamp,
@@ -92,6 +104,252 @@ export function createProject(
     starter: false,
     updatedAt: timestamp,
     projects: [...base.projects, project],
+  };
+}
+
+export type BuzzChannelImportConflictReason =
+  | "invalid_channel"
+  | "duplicate_source"
+  | "channel_identity_collision"
+  | "ambiguous_legacy"
+  | "ambiguous_name";
+
+export interface BuzzChannelImportConflict {
+  channelId: string;
+  channelName: string;
+  reason: BuzzChannelImportConflictReason;
+  projectIds: string[];
+}
+
+export interface BuzzChannelImportResult {
+  state: CockpitState;
+  importedProjectIds: string[];
+  linkedProjectIds: string[];
+  conflicts: BuzzChannelImportConflict[];
+}
+
+function normalizedProjectName(value: string): string {
+  return value.normalize("NFKC").trim().replace(/\s+/gu, " ").toLowerCase();
+}
+
+function deterministicChannelProjectId(channelId: string): string {
+  return `buzz-channel:${channelId}`;
+}
+
+function projectReferencesChannel(
+  state: CockpitState,
+  projectId: string,
+  channelId: string,
+): boolean {
+  return state.missions.some(
+    (mission) =>
+      mission.projectId === projectId &&
+      (mission.channelId?.toLowerCase() === channelId ||
+        mission.conversationRefs?.some(
+          (conversation) => conversation.channelId.toLowerCase() === channelId,
+        )),
+  );
+}
+
+/**
+ * Import selected Buzz channels as local project workspaces. Channel UUIDs are
+ * the durable identity; imported presentation fields are never synchronized
+ * over subsequent user edits.
+ */
+export function importBuzzChannelProjects(
+  state: CockpitState,
+  channels: readonly ChannelSummary[],
+  now?: string,
+): BuzzChannelImportResult {
+  const timestamp = nowIso(now);
+  const uniqueChannels = new Map<string, ChannelSummary>();
+  const conflicts: BuzzChannelImportConflict[] = [];
+
+  for (const channel of channels) {
+    const channelId = channel.id.trim().toLowerCase();
+    const channelName = channel.name.trim();
+    if (!channelId || !channelName) {
+      conflicts.push({
+        channelId,
+        channelName,
+        reason: "invalid_channel",
+        projectIds: [],
+      });
+      continue;
+    }
+    if (!uniqueChannels.has(channelId)) {
+      uniqueChannels.set(channelId, {
+        ...channel,
+        id: channelId,
+        name: channelName,
+      });
+    }
+  }
+
+  if (uniqueChannels.size === 0) {
+    return {
+      state,
+      importedProjectIds: [],
+      linkedProjectIds: [],
+      conflicts,
+    };
+  }
+
+  const base = state.starter ? createEmptyState(timestamp) : state;
+  let projects = base.projects;
+  let changed = false;
+  const importedProjectIds: string[] = [];
+  const linkedProjectIds: string[] = [];
+  const claimedProjectIds = new Set<string>();
+  const channelNameCounts = new Map<string, number>();
+
+  for (const channel of uniqueChannels.values()) {
+    const name = normalizedProjectName(channel.name);
+    channelNameCounts.set(name, (channelNameCounts.get(name) ?? 0) + 1);
+  }
+
+  const selectedChannelIds = [...uniqueChannels.keys()];
+  const legacyChannelCounts = new Map<string, number>();
+  for (const project of projects) {
+    const count = selectedChannelIds.filter((channelId) =>
+      projectReferencesChannel(base, project.id, channelId),
+    ).length;
+    legacyChannelCounts.set(project.id, count);
+  }
+
+  const addConflict = (
+    channel: ChannelSummary,
+    reason: BuzzChannelImportConflictReason,
+    candidates: readonly Project[],
+  ) => {
+    conflicts.push({
+      channelId: channel.id,
+      channelName: channel.name,
+      reason,
+      projectIds: [...new Set(candidates.map((project) => project.id))],
+    });
+  };
+
+  const linkProject = (project: Project, channelId: string) => {
+    const updated: Project = {
+      ...project,
+      buzzChannelId: channelId,
+      updatedAt: timestamp,
+    };
+    projects = projects.map((candidate) =>
+      candidate.id === project.id ? updated : candidate,
+    );
+    claimedProjectIds.add(project.id);
+    linkedProjectIds.push(project.id);
+    changed = true;
+  };
+
+  for (const channel of uniqueChannels.values()) {
+    const channelId = channel.id;
+    const sourceMatches = projects.filter(
+      (project) => project.buzzChannelId?.toLowerCase() === channelId,
+    );
+    if (sourceMatches.length > 1) {
+      addConflict(channel, "duplicate_source", sourceMatches);
+      continue;
+    }
+    if (sourceMatches.length === 1) {
+      claimedProjectIds.add(sourceMatches[0].id);
+      continue;
+    }
+
+    const deterministicId = deterministicChannelProjectId(channelId);
+    const deterministicMatch = projects.find(
+      (project) => project.id === deterministicId,
+    );
+    if (deterministicMatch) {
+      if (
+        claimedProjectIds.has(deterministicMatch.id) ||
+        (deterministicMatch.buzzChannelId &&
+          deterministicMatch.buzzChannelId.toLowerCase() !== channelId)
+      ) {
+        addConflict(channel, "channel_identity_collision", [
+          deterministicMatch,
+        ]);
+        continue;
+      }
+      linkProject(deterministicMatch, channelId);
+      continue;
+    }
+
+    const allLegacyMatches = projects.filter(
+      (project) =>
+        !project.buzzChannelId &&
+        !claimedProjectIds.has(project.id) &&
+        projectReferencesChannel(base, project.id, channelId),
+    );
+    const legacyMatches = allLegacyMatches.filter(
+      (project) => legacyChannelCounts.get(project.id) === 1,
+    );
+    if (allLegacyMatches.length > 0 && legacyMatches.length !== 1) {
+      addConflict(channel, "ambiguous_legacy", allLegacyMatches);
+      continue;
+    }
+    if (legacyMatches.length === 1) {
+      linkProject(legacyMatches[0], channelId);
+      continue;
+    }
+
+    const normalizedName = normalizedProjectName(channel.name);
+    const nameMatches = projects.filter(
+      (project) =>
+        !project.buzzChannelId &&
+        !claimedProjectIds.has(project.id) &&
+        normalizedProjectName(project.name) === normalizedName,
+    );
+    if ((channelNameCounts.get(normalizedName) ?? 0) > 1) {
+      if (nameMatches.length > 0) {
+        addConflict(channel, "ambiguous_name", nameMatches);
+        continue;
+      }
+    } else if (nameMatches.length > 1) {
+      addConflict(channel, "ambiguous_name", nameMatches);
+      continue;
+    } else if (nameMatches.length === 1) {
+      linkProject(nameMatches[0], channelId);
+      continue;
+    }
+
+    const project: Project = {
+      id: deterministicId,
+      name: channel.name,
+      description: channel.about ?? channel.purpose ?? channel.topic ?? "",
+      color: "#6e5ae6",
+      buzzChannelId: channelId,
+      missionIds: [],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    projects = [...projects, project];
+    claimedProjectIds.add(project.id);
+    importedProjectIds.push(project.id);
+    changed = true;
+  }
+
+  if (!changed) {
+    return {
+      state,
+      importedProjectIds,
+      linkedProjectIds,
+      conflicts,
+    };
+  }
+
+  return {
+    state: {
+      ...base,
+      starter: false,
+      updatedAt: timestamp,
+      projects,
+    },
+    importedProjectIds,
+    linkedProjectIds,
+    conflicts,
   };
 }
 
@@ -158,6 +416,62 @@ export function createMission(
     ),
     missions: [...base.missions, mission],
   };
+}
+
+export interface EnsureProjectConversationMissionResult {
+  state: CockpitState;
+  mission: Mission;
+}
+
+/**
+ * Ensure one stable, local mission anchors the continuous conversation for an
+ * imported Buzz-channel project. The deterministic id is never trusted by
+ * itself: project and channel ownership must also match before reuse.
+ */
+export function ensureProjectConversationMission(
+  state: CockpitState,
+  projectId: string,
+  now?: string,
+): EnsureProjectConversationMissionResult {
+  const project = state.projects.find(
+    (candidate) => candidate.id === projectId,
+  );
+  if (!project) {
+    throw new Error(`Project ${projectId} does not exist`);
+  }
+  const channelId = project.buzzChannelId?.trim().toLowerCase();
+  if (!channelId) {
+    throw new Error(`Project ${projectId} is not linked to a Buzz channel`);
+  }
+
+  const missionId = `project-conversation:${channelId}`;
+  const existing = state.missions.find((mission) => mission.id === missionId);
+  if (existing) {
+    if (
+      existing.projectId !== project.id ||
+      existing.channelId?.toLowerCase() !== channelId
+    ) {
+      throw new Error(
+        `Conversation mission ${missionId} belongs to another project or channel`,
+      );
+    }
+    return { state, mission: existing };
+  }
+
+  const next = createMission(state, {
+    id: missionId,
+    projectId: project.id,
+    title: "Conversa contínua",
+    objective: "Manter a conversa deste projeto no mesmo canal do Buzz.",
+    brief: "Workspace contínuo vinculado ao canal do projeto.",
+    channelId,
+    now,
+  });
+  const mission = next.missions.find((candidate) => candidate.id === missionId);
+  if (!mission) {
+    throw new Error(`Conversation mission ${missionId} was not created`);
+  }
+  return { state: next, mission };
 }
 
 export type MissionPatch = Partial<

@@ -189,6 +189,19 @@ export async function handleApiRequest(request, response, runtime) {
       return true;
     }
 
+    if (request.method === "GET" && url.pathname === "/api/channels/search") {
+      sendJson(
+        response,
+        200,
+        await runtime.runOperation(
+          "channels:search",
+          { query: url.searchParams.get("query") ?? undefined },
+          runtime,
+        ),
+      );
+      return true;
+    }
+
     if (request.method === "GET" && url.pathname === "/api/messages/search") {
       sendJson(
         response,

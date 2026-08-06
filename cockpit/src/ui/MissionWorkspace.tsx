@@ -25,6 +25,7 @@ import type {
   MissionStatus,
   Project,
 } from "../domain";
+import { presentMessagesForReader } from "../data";
 import {
   Composer,
   type ComposerDestination,
@@ -577,7 +578,9 @@ export function MissionWorkspace({
     .filter((dispatch): dispatch is Dispatch => Boolean(dispatch));
   const chain = spineItems(dispatches, agents);
   const pendingHandoffs = findPendingHandoffs(dispatches, agents);
-  const entries = messagesToTimelineEntries(messages, agents);
+  const presentedMessages =
+    mode === "reader" ? presentMessagesForReader(messages).messages : messages;
+  const entries = messagesToTimelineEntries(presentedMessages, agents);
   const visibleEntries = entries.filter((entry) => {
     if (conversationFilter === "all") return true;
     if (conversationFilter === "media") return timelineEntryHasMedia(entry);

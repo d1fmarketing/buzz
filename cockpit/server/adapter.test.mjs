@@ -55,12 +55,27 @@ test("CLI operation allowlist builds arrays and keeps message content on stdin",
 });
 
 test("CLI validation rejects invalid route values and limits", () => {
+  assert.deepEqual(buildCliInvocation("channels:list").args.slice(2), [
+    "channels",
+    "list",
+    "--member",
+    "--limit",
+    "500",
+  ]);
   assert.deepEqual(
     buildCliInvocation("feed:get", { limit: "120" }).args.slice(-2),
     ["--limit", "50"],
   );
   assert.throws(() =>
     buildCliInvocation("messages:get", { channelId: "../../etc/passwd" }),
+  );
+  assert.deepEqual(
+    buildCliInvocation("messages:get", {
+      channelId: CHANNEL,
+      limit: "200",
+      since: "0",
+    }).args.slice(-2),
+    ["--kinds", "9,40002,40003,40008,45001,45003"],
   );
   assert.throws(() =>
     buildCliInvocation("messages:thread", {
@@ -89,7 +104,21 @@ test("CLI validation rejects invalid route values and limits", () => {
       "20",
     ],
   );
+  assert.deepEqual(
+    buildCliInvocation("channels:search", { query: "Methylia" }).args.slice(2),
+    [
+      "channels",
+      "search",
+      "--query",
+      "Methylia",
+      "--exact",
+      "--include-archived",
+      "--limit",
+      "1000",
+    ],
+  );
   assert.throws(() => buildCliInvocation("messages:search", {}));
+  assert.throws(() => buildCliInvocation("channels:search", {}));
   assert.deepEqual(
     buildCliInvocation("channels:get", { channelId: CHANNEL }).args.slice(2),
     ["channels", "get", "--channel", CHANNEL],

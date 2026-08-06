@@ -403,11 +403,24 @@ export function buildCliInvocation(operation, input = {}) {
 
   switch (operation) {
     case "channels:list": {
-      args.push("channels", "list", "--limit", "500");
+      args.push("channels", "list", "--member", "--limit", "500");
       break;
     }
     case "channels:get": {
       args.push("channels", "get", "--channel", requireUuid(input.channelId));
+      break;
+    }
+    case "channels:search": {
+      args.push(
+        "channels",
+        "search",
+        "--query",
+        requireString(input.query, "query", { min: 1, max: 200 }),
+        "--exact",
+        "--include-archived",
+        "--limit",
+        "1000",
+      );
       break;
     }
     case "channels:members": {
@@ -427,6 +440,7 @@ export function buildCliInvocation(operation, input = {}) {
       appendOption(args, "--limit", limit);
       appendOption(args, "--since", since);
       appendOption(args, "--before", before);
+      args.push("--kinds", "9,40002,40003,40008,45001,45003");
       break;
     }
     case "messages:thread": {

@@ -85,14 +85,25 @@ export const cockpitApi = {
       body: JSON.stringify(state),
     }),
   channels: () => request<unknown>("/api/channels"),
+  searchChannels: (query: string) =>
+    request<unknown>(`/api/channels/search?query=${encodeURIComponent(query)}`),
   channel: (channelId: string) =>
     request<unknown>(`/api/channels/${encodeURIComponent(channelId)}`),
   channelMembers: (channelId: string) =>
     request<unknown>(`/api/channels/${encodeURIComponent(channelId)}/members`),
-  messages: (channelId: string, limit = 200) =>
-    request<unknown>(
-      `/api/channels/${encodeURIComponent(channelId)}/messages?limit=${encodeURIComponent(limit)}`,
-    ),
+  messages: (
+    channelId: string,
+    limit = 200,
+    cursor?: { before?: number; since?: number },
+  ) => {
+    const search = new URLSearchParams({ limit: String(limit) });
+    if (cursor?.before !== undefined)
+      search.set("before", String(cursor.before));
+    if (cursor?.since !== undefined) search.set("since", String(cursor.since));
+    return request<unknown>(
+      `/api/channels/${encodeURIComponent(channelId)}/messages?${search}`,
+    );
+  },
   thread: (channelId: string, eventId: string) =>
     request<unknown>(
       `/api/channels/${encodeURIComponent(channelId)}/threads/${encodeURIComponent(eventId)}`,

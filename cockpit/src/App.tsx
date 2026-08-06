@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -12,7 +13,9 @@ import {
   createMission,
   createProject,
   detectExplicitHandoff,
+  ensureProjectConversationMission,
   guardMissionDispatch,
+  importBuzzChannelProjects,
   linkConversation,
   updateMission,
   upsertDispatch,
@@ -20,6 +23,7 @@ import {
   type CockpitState,
   type DispatchReceipt,
   type Message,
+  type Mission,
   type MissionStatus,
 } from "./domain";
 import {
@@ -28,6 +32,7 @@ import {
   normalizeCockpitState,
   normalizeMessagesResponse,
   normalizeWriteReceipt,
+  reconcileBuzzMessageEdits,
 } from "./data";
 import { cockpitApi, fileToAttachment, type HealthStatus } from "./ui/api";
 import type { ComposerSubmission } from "./ui/Composer";
@@ -42,7 +47,6 @@ import {
 import { navigate, useRouteLocation } from "./ui/router";
 import {
   AgentsView,
-  ActivityView,
   AttentionView,
   HomeView,
   NotFoundView,
@@ -67,7 +71,9 @@ function decodePart(value: string | undefined): string | undefined {
 
 function routeFromPath(pathname: string): RouteDescriptor {
   if (pathname === "/") return { kind: "home" };
-  if (pathname === "/activity") return { kind: "activity" };
+  // Legacy global activity URLs fail closed into the project chooser. A
+  // project route is now the only place where a conversation timeline exists.
+  if (pathname === "/activity") return { kind: "home" };
   if (pathname === "/agents") return { kind: "agents" };
   if (pathname === "/attention") return { kind: "attention" };
 
@@ -188,6 +194,92 @@ function mergeFeedActivity(
   });
 }
 
+const PROJECT_HISTORY_PAGE_SIZE = 200;
+
+function isActiveBuzzProjectChannel(
+  channel: ReturnType<typeof normalizeChannelsResponse>[number],
+): boolean {
+  return (
+    !channel.archived && (channel.type === "stream" || channel.type === "forum")
+  );
+}
+
+async function enrichChannelMetadata(
+  listedChannels: ReturnType<typeof normalizeChannelsResponse>,
+): Promise<ReturnType<typeof normalizeChannelsResponse>> {
+  const names = [
+    ...new Set(
+      listedChannels
+        .filter((channel) => channel.name.trim().toLowerCase() !== "dm")
+        .map((channel) => channel.name.trim())
+        .filter(Boolean),
+    ),
+  ];
+  const results = await mapSettledWithLimit(names, 4, (name) =>
+    cockpitApi.searchChannels(name),
+  );
+  const metadata = results.flatMap((result) =>
+    result.status === "fulfilled"
+      ? normalizeChannelsResponse(result.value)
+      : [],
+  );
+  const metadataById = new Map(
+    metadata.map((channel) => [channel.id, channel]),
+  );
+  return listedChannels.map((channel) => ({
+    ...channel,
+    ...metadataById.get(channel.id),
+  }));
+}
+
+function mergeMessages(...groups: Message[][]): Message[] {
+  return [
+    ...new Map(groups.flat().map((message) => [message.id, message])).values(),
+  ].sort((left, right) => {
+    const time = Date.parse(left.createdAt) - Date.parse(right.createdAt);
+    return time === 0 ? left.id.localeCompare(right.id) : time;
+  });
+}
+
+async function readProjectHistoryPages(
+  channelId: string,
+  authorNames: Record<string, string>,
+  since?: number,
+  onPage?: (messages: Message[]) => void,
+): Promise<{ messages: Message[]; truncated: boolean }> {
+  let before: number | undefined;
+  let previousOldest: number | undefined;
+  let messages: Message[] = [];
+
+  for (;;) {
+    const raw = await cockpitApi.messages(
+      channelId,
+      PROJECT_HISTORY_PAGE_SIZE,
+      {
+        before,
+        since,
+      },
+    );
+    const batch = normalizeMessagesResponse(raw, { channelId, authorNames });
+    messages = mergeMessages(messages, batch);
+    onPage?.(messages);
+    if (batch.length < PROJECT_HISTORY_PAGE_SIZE) {
+      return { messages, truncated: false };
+    }
+
+    const oldest = Math.min(
+      ...batch.map((message) =>
+        Math.floor(Date.parse(message.createdAt) / 1000),
+      ),
+    );
+    if (!Number.isFinite(oldest) || oldest === previousOldest) {
+      return { messages, truncated: true };
+    }
+    previousOldest = oldest;
+    before = oldest - 1;
+  }
+}
+
 function decorateAgentAssignments(
   agents: AgentSummary[],
   state: CockpitState,
@@ -256,17 +348,20 @@ export default function App() {
   >([]);
   const [liveAgents, setLiveAgents] = useState<AgentSummary[]>([]);
   const [liveMessages, setLiveMessages] = useState<Message[]>([]);
-  const [activityMessages, setActivityMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [messageLoading, setMessageLoading] = useState(false);
   const [messageError, setMessageError] = useState<string>();
-  const [activityError, setActivityError] = useState<string>();
-  const [activityLoading, setActivityLoading] = useState(false);
+  const [projectMessages, setProjectMessages] = useState<Message[]>([]);
+  const [projectMessageProjectId, setProjectMessageProjectId] =
+    useState<string>();
+  const [projectMessageLoading, setProjectMessageLoading] = useState(false);
+  const [projectMessageError, setProjectMessageError] = useState<string>();
   const [fatalError, setFatalError] = useState<string>();
   const [saveError, setSaveError] = useState<string>();
   const [saving, setSaving] = useState(false);
   const [sending, setSending] = useState(false);
+  const projectHistoryRequest = useRef(0);
 
   const effectiveAgents = useMemo(() => {
     if (!state) return liveAgents;
@@ -276,12 +371,18 @@ export default function App() {
     );
   }, [liveAgents, state]);
 
-  const currentMission = state?.missions.find(
-    (mission) => mission.id === route.missionId,
-  );
   const currentProject = state?.projects.find(
     (project) => project.id === route.projectId,
   );
+  const routeMission = state?.missions.find(
+    (mission) => mission.id === route.missionId,
+  );
+  const currentMission =
+    route.kind === "mission" &&
+    currentProject &&
+    routeMission?.projectId === currentProject.id
+      ? routeMission
+      : undefined;
 
   const loadCockpit = useCallback(async (initial = false) => {
     if (initial) setLoading(true);
@@ -301,26 +402,44 @@ export default function App() {
         ]);
 
       setHealth(healthValue);
-      const nextState = createInitialState(normalizeCockpitState(stateValue));
-      setState(nextState);
-      setChannels(
+      const baseState = createInitialState(normalizeCockpitState(stateValue));
+      const listedChannels =
         channelsResult.status === "fulfilled"
           ? normalizeChannelsResponse(channelsResult.value).filter(
               (channel) => !channel.archived,
             )
-          : [],
+          : [];
+      const nextChannels = (await enrichChannelMetadata(listedChannels)).filter(
+        (channel) => !channel.archived,
       );
+      const imported = importBuzzChannelProjects(
+        baseState,
+        nextChannels.filter(isActiveBuzzProjectChannel),
+      );
+      setState(imported.state);
+      setChannels(nextChannels);
+      if (imported.state !== baseState) {
+        const saved = normalizeCockpitState(
+          await cockpitApi.saveState(imported.state),
+        );
+        setState(saved);
+      }
+      if (imported.conflicts.length > 0) {
+        setSaveError(
+          `${imported.conflicts.length} canal${imported.conflicts.length === 1 ? "" : "is"} do Buzz precisa${imported.conflicts.length === 1 ? "" : "m"} de vínculo manual com um projeto.`,
+        );
+      }
 
       if (agentsResult.status === "fulfilled") {
         const baseAgents = normalizeAgentsResponse(agentsResult.value);
         const authorNames = Object.fromEntries(
           baseAgents.map((agent) => [agent.pubkey, agent.name]),
         );
-        const normalizedFeed =
+        const normalizedFeed = reconcileBuzzMessageEdits(
           feedResult.status === "fulfilled"
             ? normalizeMessagesResponse(feedResult.value, { authorNames })
-            : [];
-        setActivityMessages(normalizedFeed);
+            : [],
+        );
         const normalizedAgents = mergeFeedActivity(baseAgents, normalizedFeed);
         const pubkeys = normalizedAgents
           .map((agent) => agent.pubkey)
@@ -338,11 +457,6 @@ export default function App() {
         }
       } else {
         setLiveAgents([]);
-        setActivityMessages(
-          feedResult.status === "fulfilled"
-            ? normalizeMessagesResponse(feedResult.value)
-            : [],
-        );
       }
     } catch (error) {
       setHealth(OFFLINE_HEALTH);
@@ -357,97 +471,127 @@ export default function App() {
     void loadCockpit(true);
   }, [loadCockpit]);
 
-  const loadActivityFeed = useCallback(
-    async (includeHistory = false) => {
-      setActivityLoading(true);
-      setActivityError(undefined);
+  useEffect(() => {
+    if (location.pathname !== "/activity") return;
+    navigate("/", { replace: true });
+  }, [location.pathname]);
+
+  useEffect(() => {
+    const project = route.kind === "project" ? currentProject : undefined;
+    const requestId = ++projectHistoryRequest.current;
+    setProjectMessageProjectId(project?.id);
+    setProjectMessages([]);
+    setProjectMessageError(undefined);
+
+    if (!project?.buzzChannelId) {
+      setProjectMessageLoading(false);
+      return;
+    }
+
+    const projectChannelId = project.buzzChannelId;
+    let active = true;
+    let initialLoaded = false;
+    let initialLoading = false;
+    let latestTimestamp = 0;
+    const authorNames = Object.fromEntries(
+      effectiveAgents.map((agent) => [agent.pubkey, agent.name]),
+    );
+
+    async function loadInitialHistory() {
+      if (initialLoading) return;
+      initialLoading = true;
+      setProjectMessageLoading(true);
       try {
-        const authorNames = Object.fromEntries(
-          effectiveAgents.map((agent) => [agent.pubkey, agent.name]),
+        const history = await readProjectHistoryPages(
+          projectChannelId,
+          authorNames,
+          undefined,
+          (partialHistory) => {
+            if (
+              active &&
+              requestId === projectHistoryRequest.current &&
+              route.kind === "project"
+            ) {
+              setProjectMessages(reconcileBuzzMessageEdits(partialHistory));
+            }
+          },
         );
-        const feedResult = await cockpitApi
-          .feed(50)
-          .then((value) => ({ status: "fulfilled" as const, value }))
-          .catch((reason) => ({ status: "rejected" as const, reason }));
-        const historyResults = includeHistory
-          ? await mapSettledWithLimit(channels, 5, async (channel) => ({
-              channel,
-              value: await cockpitApi.messages(channel.id, 25),
-            }))
-          : [];
-        const historyMessages = historyResults.flatMap((result) =>
-          result.status === "fulfilled"
-            ? normalizeMessagesResponse(result.value.value, {
-                channelId: result.value.channel.id,
-                authorNames,
-              })
-            : [],
-        );
-        const feedMessages =
-          feedResult.status === "fulfilled"
-            ? normalizeMessagesResponse(feedResult.value, { authorNames })
-            : [];
-        if (feedResult.status === "rejected" && historyMessages.length === 0) {
-          throw feedResult.reason;
+        if (
+          !active ||
+          requestId !== projectHistoryRequest.current ||
+          route.kind !== "project"
+        ) {
+          return;
         }
-        setActivityMessages((current) => {
-          const combined = includeHistory
-            ? [...historyMessages, ...feedMessages]
-            : [...current, ...feedMessages];
-          return [
-            ...new Map(
-              combined.map((message) => [message.id, message]),
-            ).values(),
-          ]
-            .sort((left, right) => {
-              const time =
-                Date.parse(left.createdAt) - Date.parse(right.createdAt);
-              return time === 0 ? left.id.localeCompare(right.id) : time;
-            })
-            .slice(-300);
-        });
-        const failedChannels = historyResults.filter(
-          (result) => result.status === "rejected",
-        ).length;
-        if (failedChannels > 0 || feedResult.status === "rejected") {
-          const details = [];
-          if (failedChannels > 0) {
-            details.push(
-              `${failedChannels} de ${channels.length} conversas não responderam`,
-            );
-          }
-          if (feedResult.status === "rejected") {
-            details.push("o feed de menções não respondeu");
-          }
-          setActivityError(
-            `${details.join("; ")}. O restante continua visível.`,
+        latestTimestamp = history.messages.reduce(
+          (latest, message) =>
+            Math.max(latest, Math.floor(Date.parse(message.createdAt) / 1000)),
+          0,
+        );
+        setProjectMessages(reconcileBuzzMessageEdits(history.messages));
+        initialLoaded = true;
+        if (history.truncated) {
+          setProjectMessageError(
+            "O cursor do Buzz não avançou em uma página do histórico; o restante visível continua isolado neste projeto.",
           );
         }
       } catch (error) {
-        setActivityError(errorMessage(error));
+        if (active && requestId === projectHistoryRequest.current) {
+          setProjectMessageError(errorMessage(error));
+        }
       } finally {
-        setActivityLoading(false);
+        initialLoading = false;
+        if (active && requestId === projectHistoryRequest.current) {
+          setProjectMessageLoading(false);
+        }
       }
-    },
-    [channels, effectiveAgents],
-  );
+    }
 
-  useEffect(() => {
-    if (route.kind !== "activity" || loading) return;
-    void loadActivityFeed(true);
-    const feedInterval = window.setInterval(
-      () => void loadActivityFeed(false),
-      15_000,
-    );
-    const historyInterval = window.setInterval(
-      () => void loadActivityFeed(true),
-      60_000,
-    );
+    async function loadNewMessages() {
+      if (!initialLoaded) {
+        await loadInitialHistory();
+        return;
+      }
+      try {
+        const history = await readProjectHistoryPages(
+          projectChannelId,
+          authorNames,
+          latestTimestamp,
+        );
+        const incoming = history.messages;
+        if (!active || requestId !== projectHistoryRequest.current) return;
+        if (incoming.length > 0) {
+          latestTimestamp = incoming.reduce(
+            (latest, message) =>
+              Math.max(
+                latest,
+                Math.floor(Date.parse(message.createdAt) / 1000),
+              ),
+            latestTimestamp,
+          );
+          setProjectMessages((current) =>
+            reconcileBuzzMessageEdits(mergeMessages(current, incoming)),
+          );
+        }
+        if (history.truncated) {
+          setProjectMessageError(
+            "A atualização ao vivo encontrou um cursor sem avanço; atualize o projeto para reconciliar o histórico.",
+          );
+        }
+      } catch (error) {
+        if (active && requestId === projectHistoryRequest.current) {
+          setProjectMessageError(errorMessage(error));
+        }
+      }
+    }
+
+    void loadInitialHistory();
+    const interval = window.setInterval(() => void loadNewMessages(), 12_000);
     return () => {
-      window.clearInterval(feedInterval);
-      window.clearInterval(historyInterval);
+      active = false;
+      window.clearInterval(interval);
     };
-  }, [loadActivityFeed, loading, route.kind]);
+  }, [currentProject, effectiveAgents, route.kind]);
 
   useEffect(() => {
     if (
@@ -455,7 +599,7 @@ export default function App() {
       route.kind === "mission" &&
       currentMission?.isSample
     ) {
-      navigate(`/activity${mode === "operator" ? "?mode=operator" : ""}`, {
+      navigate(`/${mode === "operator" ? "?mode=operator" : ""}`, {
         replace: true,
       });
     }
@@ -484,15 +628,14 @@ export default function App() {
   );
 
   const reconcileResponses = useCallback(
-    (messages: Message[]) => {
-      if (!currentMission || currentMission.isSample || messages.length === 0)
-        return;
+    (missionId: string, messages: Message[]) => {
+      if (!missionId || messages.length === 0) return;
       setState((current) => {
         if (!current) return current;
         const mission = current.missions.find(
-          (candidate) => candidate.id === currentMission.id,
+          (candidate) => candidate.id === missionId,
         );
-        if (!mission) return current;
+        if (!mission || mission.isSample) return current;
 
         let next = current;
         let changed = false;
@@ -602,8 +745,28 @@ export default function App() {
         return current;
       });
     },
-    [currentMission, effectiveAgents],
+    [effectiveAgents],
   );
+
+  useEffect(() => {
+    if (
+      route.kind !== "project" ||
+      !currentProject?.buzzChannelId ||
+      projectMessageProjectId !== currentProject.id
+    ) {
+      return;
+    }
+    reconcileResponses(
+      `project-conversation:${currentProject.buzzChannelId.toLowerCase()}`,
+      projectMessages,
+    );
+  }, [
+    currentProject,
+    projectMessageProjectId,
+    projectMessages,
+    reconcileResponses,
+    route.kind,
+  ]);
 
   const loadMissionMessages = useCallback(async () => {
     if (!currentMission || !state) {
@@ -696,14 +859,9 @@ export default function App() {
           ? { ...message, isMine: true, authorName: "Isa" }
           : message,
       );
-      const unique = [
-        ...new Map(normalized.map((message) => [message.id, message])).values(),
-      ].sort((left, right) => {
-        const time = Date.parse(left.createdAt) - Date.parse(right.createdAt);
-        return time === 0 ? left.id.localeCompare(right.id) : time;
-      });
+      const unique = reconcileBuzzMessageEdits(mergeMessages(normalized));
       setLiveMessages(unique);
-      reconcileResponses(unique);
+      reconcileResponses(currentMission.id, unique);
     } catch (error) {
       setMessageError(errorMessage(error));
     } finally {
@@ -825,16 +983,26 @@ export default function App() {
     await persistState(next, state);
   }
 
-  async function handleSend(submission: ComposerSubmission) {
-    if (!state || !currentMission) {
-      throw new Error(
-        "A missão precisa de uma conversa do Buzz antes do envio.",
-      );
+  async function sendMissionSubmission(
+    baseState: CockpitState,
+    mission: Mission,
+    submission: ComposerSubmission,
+    refreshMissionMessages: boolean,
+  ) {
+    const persistedMission = baseState.missions.find(
+      (candidate) => candidate.id === mission.id,
+    );
+    if (
+      !persistedMission ||
+      persistedMission.projectId !== mission.projectId ||
+      persistedMission.channelId !== mission.channelId
+    ) {
+      throw new Error("A missão não pertence ao workspace atual.");
     }
     const startsNewThread =
-      Boolean(currentMission.channelId) &&
-      submission.destinationId === `${currentMission.channelId}:new-thread` &&
-      submission.channelId === currentMission.channelId &&
+      Boolean(mission.channelId) &&
+      submission.destinationId === `${mission.channelId}:new-thread` &&
+      submission.channelId === mission.channelId &&
       !submission.replyTo;
     const destination = startsNewThread
       ? {
@@ -842,7 +1010,7 @@ export default function App() {
           channelId: submission.channelId,
           rootEventId: undefined,
         }
-      : currentMission.conversationRefs?.find(
+      : mission.conversationRefs?.find(
           (conversation) => conversation.id === submission.destinationId,
         );
     if (
@@ -861,7 +1029,7 @@ export default function App() {
     if (!agent)
       throw new Error("O agente escolhido não está disponível neste relay.");
 
-    const guard = guardMissionDispatch(currentMission, state.dispatches, {
+    const guard = guardMissionDispatch(mission, baseState.dispatches, {
       agentId: agent.pubkey || agent.id,
       depth: submission.depth ?? 0,
       parentDispatchId: submission.parentDispatchId,
@@ -871,14 +1039,10 @@ export default function App() {
     const timestamp = new Date().toISOString();
     const dispatchId = newLocalId("dispatch");
     const depth = submission.depth ?? 0;
-    const sendContent = operationalPrompt(
-      submission.content,
-      currentMission,
-      depth,
-    );
-    let next = upsertDispatch(state, {
+    const sendContent = operationalPrompt(submission.content, mission, depth);
+    let next = upsertDispatch(baseState, {
       id: dispatchId,
-      missionId: currentMission.id,
+      missionId: mission.id,
       agentId: agent.pubkey || agent.id,
       agentName: agent.name,
       prompt: submission.content,
@@ -891,11 +1055,9 @@ export default function App() {
       parentDispatchId: submission.parentDispatchId,
       channelId: destinationChannelId,
     });
-    next = updateMission(next, currentMission.id, {
+    next = updateMission(next, mission.id, {
       status: "running",
-      agentIds: [
-        ...new Set([...currentMission.agentIds, agent.pubkey || agent.id]),
-      ],
+      agentIds: [...new Set([...mission.agentIds, agent.pubkey || agent.id])],
     });
 
     setSending(true);
@@ -928,11 +1090,11 @@ export default function App() {
           eventId: receipt.eventId,
         });
         const conversationRoot = submission.replyTo ?? receipt.eventId;
-        delivered = linkConversation(delivered, currentMission.id, {
+        delivered = linkConversation(delivered, mission.id, {
           channelId: destinationChannelId,
           rootEventId: conversationRoot,
           label:
-            currentMission.conversationRefs?.find(
+            mission.conversationRefs?.find(
               (conversation) => conversation.id === submission.destinationId,
             )?.label ?? agent.name,
           agentIds: [agent.pubkey || agent.id],
@@ -978,7 +1140,7 @@ export default function App() {
         }
         trackedState = delivered;
         await persistState(delivered, next);
-        await loadMissionMessages();
+        if (refreshMissionMessages) await loadMissionMessages();
         return;
       }
 
@@ -1022,8 +1184,8 @@ export default function App() {
                 severity: "warning",
                 title: `${agent.name}: dispatch bloqueado`,
                 detail: errorMessage(error),
-                projectId: currentMission.projectId,
-                missionId: currentMission.id,
+                projectId: mission.projectId,
+                missionId: mission.id,
                 dispatchId,
                 createdAt: blockedAt,
               },
@@ -1036,6 +1198,67 @@ export default function App() {
     } finally {
       setSending(false);
     }
+  }
+
+  async function handleSend(submission: ComposerSubmission) {
+    if (!state || !currentMission) {
+      throw new Error(
+        "A missão precisa de uma conversa do Buzz antes do envio.",
+      );
+    }
+    await sendMissionSubmission(state, currentMission, submission, true);
+  }
+
+  async function handleProjectSend(submission: ComposerSubmission) {
+    if (!state || !currentProject?.buzzChannelId) {
+      throw new Error("Este projeto ainda não está vinculado a um canal Buzz.");
+    }
+    if (
+      projectMessageProjectId !== currentProject.id ||
+      submission.channelId !== currentProject.buzzChannelId
+    ) {
+      throw new Error("A conversa escolhida não pertence a este projeto.");
+    }
+
+    const startsNewThread =
+      submission.destinationId ===
+        `${currentProject.buzzChannelId}:new-thread` && !submission.replyTo;
+    if (
+      !startsNewThread &&
+      (!submission.replyTo ||
+        !projectMessages.some(
+          (message) =>
+            message.channelId === currentProject.buzzChannelId &&
+            message.threadId === submission.replyTo,
+        ))
+    ) {
+      throw new Error("Esta thread não faz parte do histórico deste projeto.");
+    }
+
+    let ensured = ensureProjectConversationMission(state, currentProject.id);
+    if (!startsNewThread && submission.replyTo) {
+      const linkedState = linkConversation(ensured.state, ensured.mission.id, {
+        id: submission.destinationId,
+        channelId: currentProject.buzzChannelId,
+        rootEventId: submission.replyTo,
+        label: `Thread #${submission.replyTo.slice(0, 8)}`,
+        agentIds: [],
+      });
+      const linkedMission = linkedState.missions.find(
+        (mission) => mission.id === ensured.mission.id,
+      );
+      if (!linkedMission) {
+        throw new Error("A conversa contínua do projeto não foi vinculada.");
+      }
+      ensured = { state: linkedState, mission: linkedMission };
+    }
+
+    await sendMissionSubmission(
+      ensured.state,
+      ensured.mission,
+      submission,
+      false,
+    );
   }
 
   async function handleDraftAgentModel(input: {
@@ -1070,34 +1293,48 @@ export default function App() {
     content = (
       <HomeView
         state={state}
-        agents={effectiveAgents}
         mode={mode}
         saving={saving}
         onCreateProject={handleCreateProject}
       />
     );
-  } else if (route.kind === "activity") {
-    content = (
-      <ActivityView
-        messages={activityMessages}
-        agents={effectiveAgents}
-        channels={channels}
-        state={state}
-        loading={activityLoading}
-        error={activityError}
-        selectedAgentPubkey={location.search.get("agent") ?? undefined}
-      />
-    );
   } else if (route.kind === "project" && currentProject) {
+    const isCurrentProjectHistory =
+      projectMessageProjectId === currentProject.id;
+    const projectMissionIds = new Set(
+      state.missions
+        .filter((mission) => mission.projectId === currentProject.id)
+        .map((mission) => mission.id),
+    );
+    const ownEventIds = new Set(
+      state.dispatches.flatMap((dispatch) =>
+        projectMissionIds.has(dispatch.missionId) && dispatch.eventId
+          ? [dispatch.eventId]
+          : [],
+      ),
+    );
+    const scopedMessages = isCurrentProjectHistory
+      ? projectMessages.map((message) =>
+          ownEventIds.has(message.id)
+            ? { ...message, isMine: true, authorName: "Isa" }
+            : message,
+        )
+      : [];
     content = (
       <ProjectView
+        key={currentProject.id}
         project={currentProject}
         state={state}
         agents={effectiveAgents}
         channels={channels}
+        messages={scopedMessages}
+        messageLoading={!isCurrentProjectHistory || projectMessageLoading}
+        messageError={isCurrentProjectHistory ? projectMessageError : undefined}
         mode={mode}
         saving={saving}
+        sending={sending}
         onCreateMission={handleCreateMission}
+        onSend={handleProjectSend}
       />
     );
   } else if (route.kind === "mission" && currentProject && currentMission) {

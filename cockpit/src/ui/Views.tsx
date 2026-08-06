@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from "react";
+import { useState, type FormEvent } from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -20,30 +20,23 @@ import type {
   ChannelSummary,
   CockpitState,
   Message,
-  Mission,
   Project,
 } from "../domain";
+import { presentMessagesForReader } from "../data";
 import { compactId, formatRelativeTime } from "./format";
 import {
-  Avatar,
-  EmptyState,
-  InternalLink,
-  RowAction,
-  StateBadge,
-} from "./primitives";
-import {
-  activityLabel,
-  missionStatusLabel,
-  missionStatusTone,
-  presenceLabel,
-} from "./status";
+  Composer,
+  type ComposerDestination,
+  type ComposerSubmission,
+} from "./Composer";
+import { Avatar, EmptyState, InternalLink } from "./primitives";
+import { activityLabel, missionStatusLabel, presenceLabel } from "./status";
 import type { CockpitMode } from "./Shell";
 import {
   messagesToTimelineEntries,
   Timeline,
   timelineEntryHasMedia,
 } from "./Timeline";
-import { updateSearchParam } from "./router";
 
 export function SampleBanner() {
   return (
@@ -51,61 +44,6 @@ export function SampleBanner() {
       <FlaskConical size={15} aria-hidden="true" />
       <span>Exemplo local — nenhum prompt desta área foi enviado ao Buzz.</span>
     </div>
-  );
-}
-
-function MissionIndex({
-  missions,
-  projects,
-}: {
-  missions: Mission[];
-  projects: Project[];
-}) {
-  if (missions.length === 0) {
-    return (
-      <EmptyState
-        title="Nenhuma missão ainda"
-        description="Crie uma missão para reunir o brief, as threads e a sequência de agentes em um único lugar."
-      />
-    );
-  }
-
-  return (
-    <ul className="index-list">
-      {missions.map((mission) => {
-        const project = projects.find(
-          (candidate) => candidate.id === mission.projectId,
-        );
-        return (
-          <li key={mission.id}>
-            <InternalLink
-              className="index-row"
-              href={`/projects/${encodeURIComponent(mission.projectId)}/missions/${encodeURIComponent(mission.id)}`}
-            >
-              <div className="index-row__primary">
-                <strong>{mission.title}</strong>
-                <p>
-                  {mission.objective ||
-                    mission.brief ||
-                    "Sem objetivo registrado."}
-                </p>
-              </div>
-              <div className="index-row__cell">
-                <span>Projeto</span>
-                <p>{project?.name ?? "Projeto"}</p>
-              </div>
-              <div className="index-row__cell">
-                <span>Estado</span>
-                <StateBadge tone={missionStatusTone[mission.status]}>
-                  {missionStatusLabel[mission.status]}
-                </StateBadge>
-              </div>
-              <RowAction />
-            </InternalLink>
-          </li>
-        );
-      })}
-    </ul>
   );
 }
 
@@ -189,13 +127,11 @@ function NewProjectPanel({
 
 export function HomeView({
   state,
-  agents,
   mode,
   saving,
   onCreateProject,
 }: {
   state: CockpitState;
-  agents: AgentSummary[];
   mode: CockpitMode;
   saving: boolean;
   onCreateProject: (input: {
@@ -204,28 +140,17 @@ export function HomeView({
   }) => Promise<void>;
 }) {
   const [creating, setCreating] = useState(false);
-  const activeMissions = state.missions.filter(
-    (mission) => mission.status === "running",
-  );
-  const workingAgents = agents.filter((agent) => agent.activity === "working");
-  const openAttention = state.attention.filter((item) => !item.resolvedAt);
-  const recent = [...state.missions]
-    .sort(
-      (left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt),
-    )
-    .slice(0, 8);
-
   return (
-    <div className="page">
-      <header className="page-heading">
+    <div className="page page--project-picker">
+      <header className="page-heading project-picker-heading">
         <div className="page-heading__copy">
           <span className="eyebrow">
             <Sparkles size={13} aria-hidden="true" /> Venture Studio
           </span>
-          <h1>Projetos organizados. Conversas sempre visíveis.</h1>
+          <h1>Qual projeto você quer acompanhar?</h1>
           <p>
-            Acompanhe cada fala, thread, handoff e artefato do Buzz pelo caminho
-            que o trabalho percorreu.
+            Cada projeto abre seu próprio histórico, suas threads, agentes,
+            handoffs e arquivos — sem misturar conversas de outros projetos.
           </p>
         </div>
         {mode === "operator" ? (
@@ -252,205 +177,71 @@ export function HomeView({
         }}
       />
 
-      <section className="signal-strip" aria-label="Resumo do cockpit">
-        <div className="signal">
-          <span className="signal__value">{state.projects.length}</span>
-          <span className="signal__label">projetos</span>
-        </div>
-        <div className="signal">
-          <span className="signal__value">{activeMissions.length}</span>
-          <span className="signal__label">missões em curso</span>
-        </div>
-        <div className="signal">
-          <span className="signal__value">{workingAgents.length}</span>
-          <span className="signal__label">agentes trabalhando</span>
-        </div>
-        <div className="signal">
-          <span className="signal__value">{openAttention.length}</span>
-          <span className="signal__label">itens de atenção</span>
-        </div>
-      </section>
-
-      <section className="section-block">
+      <section className="section-block project-picker">
         <header className="section-heading">
-          <h2>Missões recentes</h2>
-          <span>{recent.length} visíveis</span>
+          <h2>Projetos do Buzz</h2>
+          <span>{state.projects.length} disponíveis</span>
         </header>
-        <MissionIndex missions={recent} projects={state.projects} />
+        {state.projects.length === 0 ? (
+          <EmptyState
+            title="Nenhum projeto vinculado"
+            description="Atualize o Buzz para importar os canais ativos ou crie um projeto local."
+          />
+        ) : (
+          <ul className="project-picker__grid">
+            {state.projects.map((project) => {
+              const missions = state.missions.filter(
+                (mission) => mission.projectId === project.id,
+              );
+              return (
+                <li key={project.id}>
+                  <InternalLink
+                    href={`/projects/${encodeURIComponent(project.id)}`}
+                    className="project-card"
+                  >
+                    <div className="project-card__topline">
+                      <span
+                        className="project-list__dot"
+                        style={
+                          {
+                            "--project-color": project.color,
+                          } as React.CSSProperties
+                        }
+                      />
+                      <span>
+                        {project.buzzChannelId
+                          ? "Buzz ao vivo"
+                          : "Projeto local"}
+                      </span>
+                    </div>
+                    <strong>{project.name}</strong>
+                    <p>
+                      {project.description ||
+                        "Abra o histórico completo deste projeto."}
+                    </p>
+                    <footer>
+                      <span>
+                        {project.buzzChannelId
+                          ? "Histórico conectado"
+                          : `${missions.length} missões`}
+                      </span>
+                      <span>
+                        Abrir projeto{" "}
+                        <ArrowRight size={14} aria-hidden="true" />
+                      </span>
+                    </footer>
+                  </InternalLink>
+                </li>
+              );
+            })}
+          </ul>
+        )}
       </section>
-
-      {openAttention.length > 0 ? (
-        <section className="section-block">
-          <header className="section-heading">
-            <h2>Precisa de atenção</h2>
-            <InternalLink href="/attention" className="row-action">
-              Ver tudo <ArrowRight size={14} aria-hidden="true" />
-            </InternalLink>
-          </header>
-          <AttentionRows items={openAttention.slice(0, 3)} state={state} />
-        </section>
-      ) : null}
     </div>
   );
 }
 
 type ActivityScope = "all" | "handoffs" | "media";
-
-const ACTIVITY_MESSAGE_KINDS = new Set([9, 40002, 40008, 45001, 45003]);
-
-export function ActivityView({
-  messages,
-  agents,
-  channels,
-  state,
-  loading,
-  error,
-  selectedAgentPubkey,
-}: {
-  messages: Message[];
-  agents: AgentSummary[];
-  channels: ChannelSummary[];
-  state: CockpitState;
-  loading: boolean;
-  error?: string;
-  selectedAgentPubkey?: string;
-}) {
-  const [scope, setScope] = useState<ActivityScope>("all");
-  const entries = useMemo(() => {
-    const messageById = new Map(
-      messages
-        .filter(
-          (message) =>
-            ACTIVITY_MESSAGE_KINDS.has(message.kind) &&
-            Boolean(message.content.trim() || message.attachments.length),
-        )
-        .map((message) => [message.id, message]),
-    );
-    return messagesToTimelineEntries([...messageById.values()], agents).map(
-      (entry) => {
-        const source = messageById.get(entry.id);
-        const channel = channels.find(
-          (candidate) => candidate.id === source?.channelId,
-        );
-        const rootId = source?.rootId ?? source?.threadId;
-        const mission = state.missions.find((candidate) => {
-          if (candidate.conversationRefs?.length) {
-            return candidate.conversationRefs.some(
-              (conversation) =>
-                conversation.channelId === source?.channelId &&
-                (!conversation.rootEventId ||
-                  conversation.rootEventId === rootId),
-            );
-          }
-          return candidate.channelId === source?.channelId;
-        });
-        const project = state.projects.find(
-          (candidate) => candidate.id === mission?.projectId,
-        );
-        return {
-          ...entry,
-          contextLabel: mission
-            ? `${project?.name ?? "Projeto"} · ${mission.title}`
-            : `#${channel?.name ?? `canal ${compactId(source?.channelId ?? "")}`}`,
-          contextHref: mission
-            ? `/projects/${encodeURIComponent(mission.projectId)}/missions/${encodeURIComponent(mission.id)}`
-            : undefined,
-        };
-      },
-    );
-  }, [agents, channels, messages, state.missions, state.projects]);
-
-  const visibleEntries = entries.filter((entry) => {
-    if (
-      selectedAgentPubkey &&
-      entry.authorPubkey !== selectedAgentPubkey &&
-      !entry.mentions?.some((mention) => mention.pubkey === selectedAgentPubkey)
-    ) {
-      return false;
-    }
-    if (scope === "media") return timelineEntryHasMedia(entry);
-    if (scope === "handoffs")
-      return Boolean(entry.handoffTargetPubkeys?.length);
-    return true;
-  });
-
-  return (
-    <div className="page page--activity">
-      <header className="page-heading activity-heading">
-        <div className="page-heading__copy">
-          <span className="eyebrow">
-            <MessageSquareMore size={13} aria-hidden="true" /> Buzz ao vivo
-          </span>
-          <h1>A conversa do time, em sequência.</h1>
-          <p>
-            Histórico recente dos canais e DMs, com falas, menções, handoffs e
-            arquivos. Somente exceções entram em Atenção.
-          </p>
-        </div>
-        <label className="activity-agent-filter">
-          <span>Ver conversa de</span>
-          <select
-            value={selectedAgentPubkey ?? ""}
-            onChange={(event) =>
-              updateSearchParam("agent", event.target.value || undefined)
-            }
-          >
-            <option value="">Todos os agentes</option>
-            {agents.map((agent) => (
-              <option value={agent.pubkey || agent.id} key={agent.id}>
-                {agent.name}
-              </option>
-            ))}
-          </select>
-        </label>
-      </header>
-
-      <fieldset className="activity-toolbar" aria-label="Filtros de atividade">
-        <button
-          type="button"
-          className={scope === "all" ? "is-active" : undefined}
-          aria-pressed={scope === "all"}
-          onClick={() => setScope("all")}
-        >
-          <MessageSquareMore size={14} aria-hidden="true" /> Todas
-          <span>{entries.length}</span>
-        </button>
-        <button
-          type="button"
-          className={scope === "handoffs" ? "is-active" : undefined}
-          aria-pressed={scope === "handoffs"}
-          onClick={() => setScope("handoffs")}
-        >
-          <GitBranch size={14} aria-hidden="true" /> Handoffs
-        </button>
-        <button
-          type="button"
-          className={scope === "media" ? "is-active" : undefined}
-          aria-pressed={scope === "media"}
-          onClick={() => setScope("media")}
-        >
-          <Images size={14} aria-hidden="true" /> Imagens e arquivos
-        </button>
-      </fieldset>
-
-      {error ? (
-        <div className="mission-alert" role="alert">
-          <AlertTriangle size={15} aria-hidden="true" /> {error}
-        </div>
-      ) : null}
-      {loading && entries.length === 0 ? (
-        <div className="empty-state" aria-live="polite">
-          <LoaderCircle className="spin" size={20} aria-hidden="true" />
-          <p>Lendo a atividade real do Buzz…</p>
-        </div>
-      ) : (
-        <section className="activity-stream" aria-label="Atividade do Buzz">
-          <Timeline entries={visibleEntries} order="newest" />
-        </section>
-      )}
-    </div>
-  );
-}
 
 function NewMissionPanel({
   channels,
@@ -511,7 +302,9 @@ function NewMissionPanel({
             value={channelId}
             onChange={(event) => setChannelId(event.target.value)}
           >
-            <option value="">Vincular depois</option>
+            {channels.length !== 1 ? (
+              <option value="">Vincular depois</option>
+            ) : null}
             {channels.map((channel) => (
               <option value={channel.id} key={channel.id}>
                 {channel.name} · {compactId(channel.id)}
@@ -551,23 +344,36 @@ export function ProjectView({
   state,
   agents,
   channels,
+  messages,
+  messageLoading,
+  messageError,
   mode,
   saving,
+  sending,
   onCreateMission,
+  onSend,
 }: {
   project: Project;
   state: CockpitState;
   agents: AgentSummary[];
   channels: ChannelSummary[];
+  messages: Message[];
+  messageLoading: boolean;
+  messageError?: string;
   mode: CockpitMode;
   saving: boolean;
+  sending: boolean;
   onCreateMission: (input: {
     title: string;
     objective: string;
     channelId?: string;
   }) => Promise<void>;
+  onSend: (submission: ComposerSubmission) => Promise<void>;
 }) {
   const [creating, setCreating] = useState(false);
+  const [scope, setScope] = useState<ActivityScope>("all");
+  const [agentFilter, setAgentFilter] = useState("");
+  const [threadFilter, setThreadFilter] = useState("");
   const missions = state.missions.filter(
     (mission) => mission.projectId === project.id,
   );
@@ -578,10 +384,93 @@ export function ProjectView({
     (agent) =>
       projectAgentIds.has(agent.id) || projectAgentIds.has(agent.pubkey),
   );
+  const readerPresentation = presentMessagesForReader(messages);
+  const presentedMessages =
+    mode === "reader" ? readerPresentation.messages : messages;
+  const messageById = new Map(
+    presentedMessages.map((message) => [message.id, message]),
+  );
+  const entries = messagesToTimelineEntries(presentedMessages, agents).map(
+    (entry) => ({
+      ...entry,
+      contextLabel: `Thread #${compactId(entry.threadId ?? entry.id)}`,
+    }),
+  );
+  const participantIds = new Set(
+    entries.flatMap((entry) =>
+      entry.authorPubkey ? [entry.authorPubkey] : [],
+    ),
+  );
+  const speakingAgents = agents.filter(
+    (agent) => participantIds.has(agent.pubkey) || participantIds.has(agent.id),
+  );
+  const threadMap = new Map<
+    string,
+    { id: string; title: string; count: number; updatedAt?: string }
+  >();
+  for (const entry of entries) {
+    const threadId = entry.threadId ?? entry.id;
+    const current = threadMap.get(threadId);
+    const source = messageById.get(entry.id);
+    const fallbackTitle =
+      source?.content.replace(/\s+/g, " ").trim().slice(0, 72) ||
+      `Thread #${compactId(threadId)}`;
+    threadMap.set(threadId, {
+      id: threadId,
+      title: current?.title ?? fallbackTitle,
+      count: (current?.count ?? 0) + 1,
+      updatedAt:
+        !current?.updatedAt ||
+        Date.parse(entry.createdAt ?? "") > Date.parse(current.updatedAt)
+          ? entry.createdAt
+          : current.updatedAt,
+    });
+  }
+  const threads = [...threadMap.values()].sort(
+    (left, right) =>
+      Date.parse(right.updatedAt ?? "") - Date.parse(left.updatedAt ?? ""),
+  );
+  const visibleEntries = entries.filter((entry) => {
+    if (threadFilter && (entry.threadId ?? entry.id) !== threadFilter)
+      return false;
+    if (
+      agentFilter &&
+      entry.authorPubkey !== agentFilter &&
+      !entry.mentions?.some((mention) => mention.pubkey === agentFilter)
+    ) {
+      return false;
+    }
+    if (scope === "handoffs")
+      return Boolean(entry.handoffTargetPubkeys?.length);
+    if (scope === "media") return timelineEntryHasMedia(entry);
+    return true;
+  });
+  const projectChannel = channels.find(
+    (channel) => channel.id === project.buzzChannelId,
+  );
+  const conversationDestinations: ComposerDestination[] = project.buzzChannelId
+    ? [
+        {
+          id: `${project.buzzChannelId}:new-thread`,
+          channelId: project.buzzChannelId,
+          label: `Nova conversa · ${projectChannel?.name ?? project.name}`,
+        },
+        ...threads.map((thread) => ({
+          id: `${project.buzzChannelId}:${thread.id}`,
+          channelId: project.buzzChannelId ?? "",
+          replyTo: thread.id,
+          label: `${thread.title} · #${compactId(thread.id)}`,
+        })),
+      ]
+    : [];
+  const preferredDestinationId =
+    threadFilter && project.buzzChannelId
+      ? `${project.buzzChannelId}:${threadFilter}`
+      : undefined;
 
   return (
-    <div className="page">
-      <header className="page-heading">
+    <div className="page page--project-workspace">
+      <header className="page-heading project-workspace-heading">
         <div className="page-heading__copy">
           <span className="eyebrow">
             <span
@@ -595,7 +484,7 @@ export function ProjectView({
           <h1>{project.name}</h1>
           <p>
             {project.description ||
-              "Reúna aqui as missões e threads deste projeto."}
+              `Histórico ao vivo de #${projectChannel?.name ?? project.name}.`}
           </p>
         </div>
         {mode === "operator" ? (
@@ -612,7 +501,7 @@ export function ProjectView({
       {project.isSample ? <SampleBanner /> : null}
       {creating ? (
         <NewMissionPanel
-          channels={channels}
+          channels={projectChannel ? [projectChannel] : []}
           saving={saving}
           onClose={() => setCreating(false)}
           onCreate={async (input) => {
@@ -622,39 +511,204 @@ export function ProjectView({
         />
       ) : null}
 
-      <section className="signal-strip" aria-label="Resumo do projeto">
-        <div className="signal">
-          <span className="signal__value">{missions.length}</span>
-          <span className="signal__label">missões</span>
+      {messageError ? (
+        <div className="mission-alert" role="alert">
+          <AlertTriangle size={15} aria-hidden="true" /> {messageError}
         </div>
-        <div className="signal">
-          <span className="signal__value">
-            {missions.filter((mission) => mission.status === "running").length}
-          </span>
-          <span className="signal__label">em curso</span>
-        </div>
-        <div className="signal">
-          <span className="signal__value">{projectAgents.length}</span>
-          <span className="signal__label">especialistas envolvidos</span>
-        </div>
-        <div className="signal">
-          <span className="signal__value">
-            {missions.reduce(
-              (count, mission) => count + mission.threadIds.length,
-              0,
-            )}
-          </span>
-          <span className="signal__label">threads vinculadas</span>
-        </div>
-      </section>
+      ) : null}
 
-      <section className="section-block">
-        <header className="section-heading">
-          <h2>Missões</h2>
-          <span>{missions.length} no projeto</span>
-        </header>
-        <MissionIndex missions={missions} projects={state.projects} />
-      </section>
+      <div className="project-workspace-grid">
+        <section
+          className="project-history"
+          aria-label={`Histórico de ${project.name}`}
+        >
+          <header className="project-history__heading">
+            <div>
+              <span className="live-dot" aria-hidden="true" />
+              <strong>
+                {threadFilter
+                  ? "Conversa selecionada"
+                  : mode === "reader"
+                    ? "Conversa do projeto"
+                    : "Todo o projeto"}
+              </strong>
+            </div>
+            <span>
+              {visibleEntries.length} de {entries.length} falas
+            </span>
+          </header>
+          <fieldset
+            className="activity-toolbar"
+            aria-label="Filtros do projeto"
+          >
+            <button
+              type="button"
+              className={scope === "all" ? "is-active" : undefined}
+              aria-pressed={scope === "all"}
+              onClick={() => setScope("all")}
+            >
+              <MessageSquareMore size={14} aria-hidden="true" /> Todas
+            </button>
+            <button
+              type="button"
+              className={scope === "handoffs" ? "is-active" : undefined}
+              aria-pressed={scope === "handoffs"}
+              onClick={() => setScope("handoffs")}
+            >
+              <GitBranch size={14} aria-hidden="true" /> Handoffs
+            </button>
+            <button
+              type="button"
+              className={scope === "media" ? "is-active" : undefined}
+              aria-pressed={scope === "media"}
+              onClick={() => setScope("media")}
+            >
+              <Images size={14} aria-hidden="true" /> Arquivos
+            </button>
+            <label className="project-agent-filter">
+              <span className="sr-only">Filtrar por agente</span>
+              <select
+                value={agentFilter}
+                onChange={(event) => setAgentFilter(event.target.value)}
+              >
+                <option value="">Todo o time</option>
+                {speakingAgents.map((agent) => (
+                  <option value={agent.pubkey || agent.id} key={agent.id}>
+                    {agent.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </fieldset>
+          {mode === "operator" ? (
+            <div className="composer-wrap project-composer">
+              <Composer
+                agents={agents.map((agent) => ({
+                  pubkey: agent.pubkey || agent.id,
+                  name: agent.name,
+                  role: agent.role,
+                }))}
+                destinations={conversationDestinations}
+                preferredDestinationId={preferredDestinationId}
+                disabled={
+                  messageLoading ||
+                  !project.buzzChannelId ||
+                  conversationDestinations.length === 0
+                }
+                sending={sending}
+                onSend={onSend}
+              />
+              <p className="operator-note">
+                O envio e os arquivos usam o mesmo canal, relay e OAuth do Buzz.
+              </p>
+            </div>
+          ) : null}
+          {messageLoading && entries.length === 0 ? (
+            <div className="empty-state" aria-live="polite">
+              <LoaderCircle className="spin" size={20} aria-hidden="true" />
+              <p>Lendo o histórico completo de {project.name}…</p>
+            </div>
+          ) : (
+            <Timeline entries={visibleEntries} order="newest" />
+          )}
+        </section>
+
+        <aside
+          className="project-context"
+          aria-label={`Conversas de ${project.name}`}
+        >
+          <section className="project-thread-list">
+            <header>
+              <strong>Conversas</strong>
+              <span>{threads.length}</span>
+            </header>
+            <button
+              type="button"
+              className={!threadFilter ? "is-active" : undefined}
+              onClick={() => setThreadFilter("")}
+            >
+              <span>
+                <strong>
+                  {mode === "reader"
+                    ? "Conversa do projeto"
+                    : "Todo o histórico"}
+                </strong>
+                <small>
+                  {mode === "reader"
+                    ? "Conversa sem protocolo"
+                    : "Projeto completo"}
+                </small>
+              </span>
+              <small>{entries.length}</small>
+            </button>
+            <div className="project-thread-list__scroll">
+              {threads.map((thread) => (
+                <button
+                  type="button"
+                  className={
+                    threadFilter === thread.id ? "is-active" : undefined
+                  }
+                  onClick={() => setThreadFilter(thread.id)}
+                  key={thread.id}
+                >
+                  <span>
+                    <strong>{thread.title}</strong>
+                    <small>{formatRelativeTime(thread.updatedAt)}</small>
+                  </span>
+                  <small>{thread.count}</small>
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <section className="project-context__section">
+            <header>
+              <strong>Missões</strong>
+              <span>{missions.length}</span>
+            </header>
+            {missions.length === 0 ? (
+              <p>
+                Nenhuma missão criada; o histórico do canal já está visível.
+              </p>
+            ) : (
+              <ul>
+                {missions.map((mission) => (
+                  <li key={mission.id}>
+                    <InternalLink
+                      href={`/projects/${encodeURIComponent(project.id)}/missions/${encodeURIComponent(mission.id)}`}
+                    >
+                      <span>
+                        <strong>{mission.title}</strong>
+                        <small>{missionStatusLabel[mission.status]}</small>
+                      </span>
+                      <ArrowRight size={13} aria-hidden="true" />
+                    </InternalLink>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
+          <section className="project-context__section">
+            <header>
+              <strong>Time neste projeto</strong>
+              <span>{speakingAgents.length || projectAgents.length}</span>
+            </header>
+            <div className="project-agent-stack">
+              {(speakingAgents.length ? speakingAgents : projectAgents)
+                .slice(0, 12)
+                .map((agent) => (
+                  <Avatar
+                    name={agent.name}
+                    imageUrl={agent.avatarUrl}
+                    tone="violet"
+                    key={agent.id}
+                  />
+                ))}
+            </div>
+          </section>
+        </aside>
+      </div>
     </div>
   );
 }
@@ -865,12 +919,14 @@ export function AgentsView({
                   {mission || project ? (
                     <p>{mission?.title ?? project?.name}</p>
                   ) : null}
-                  <InternalLink
-                    href={`/activity?agent=${encodeURIComponent(agent.pubkey || agent.id)}`}
-                    className="agent-row__conversation"
-                  >
-                    Ver falas <ArrowRight size={12} aria-hidden="true" />
-                  </InternalLink>
+                  {project ? (
+                    <InternalLink
+                      href={`/projects/${encodeURIComponent(project.id)}`}
+                      className="agent-row__conversation"
+                    >
+                      Abrir projeto <ArrowRight size={12} aria-hidden="true" />
+                    </InternalLink>
+                  ) : null}
                 </div>
               </li>
             );

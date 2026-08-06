@@ -11,9 +11,15 @@ It never reads an OpenAI, Anthropic or other LLM API key.
 
 ## Included in this first delivery
 
-- project and mission organization in one local JSON file;
-- global Activity stream with the real Buzz conversation, grouped by channel
-  context and filterable by agent, handoff, or media;
+- automatic, idempotent import of the active Buzz channels as local project
+  workspaces, keyed by the stable channel UUID;
+- a project chooser followed by one isolated history per project: switching
+  projects replaces the entire timeline instead of filtering a global inbox;
+- complete channel-history pagination, live incremental refresh, and a thread
+  navigator filterable by agent, handoff, or media;
+- a human-first Reader presentation that removes strict orchestration receipts,
+  mass readback acknowledgements and internal paths while Operator preserves the
+  untouched Buzz events for audit;
 - readable Buzz thread timeline with Markdown, reply context, mentions, and
   exact event/thread references;
 - inline image galleries, native video, file cards, and full-screen image
@@ -22,7 +28,8 @@ It never reads an OpenAI, Anthropic or other LLM API key.
   timeline and per-agent conversation views;
 - chronological Chain with distinct send, relay, work, response and handoff
   receipts;
-- Reader and Operator modes;
+- Reader and Operator modes, plus a project-level composer backed by one
+  idempotent continuous-conversation mission per Buzz channel;
 - real managed-agent roster, configured model, presence signal and recent
   response activity;
 - focused Attention queue for blocks, decisions and explicit handoffs;
@@ -72,8 +79,9 @@ BUZZ_CLI_PATH=/path/to/buzz
 BUZZ_COCKPIT_STATE_PATH=/path/to/state.json
 ```
 
-Projects, missions, conversation links, and visual loop state live in one
-local JSON file under the user's Application Support directory. Messages,
+Project-to-channel links, missions, conversation links, and visual loop state
+live in one local JSON file under the user's Application Support directory.
+Project names and descriptions remain user-owned after import. Messages,
 replies, files, presence, and profiles remain in Buzz.
 
 The adapter binds only to `127.0.0.1`, uses `spawn(..., { shell: false })`, and

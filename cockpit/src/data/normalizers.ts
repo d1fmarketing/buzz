@@ -157,7 +157,11 @@ function parseImeta(
   const urlName = url?.split("/").pop()?.split("?")[0];
   return {
     id: hash ?? stableLocalId("attachment", `${url ?? ""}:${index}`),
-    name: fields.get("name") ?? urlName ?? `Attachment ${index + 1}`,
+    name:
+      fields.get("filename") ??
+      fields.get("name") ??
+      urlName ??
+      `Attachment ${index + 1}`,
     url,
     thumbnailUrl: fields.get("thumb"),
     mimeType: fields.get("m"),
@@ -284,70 +288,146 @@ export interface NormalizeMessageOptions {
   ownerPubkey?: string;
 }
 
+const BUZZ_MESSAGE_EDIT_KIND = 40003;
+const BUZZ_EVENT_ID_RE = /^[0-9a-f]{64}$/i;
+
+function editTargetId(message: Message): string | undefined {
+  return message.tags.find(
+    (tag) => tag[0] === "e" && BUZZ_EVENT_ID_RE.test(tag[1] ?? ""),
+  )?.[1];
+}
+
+function editIsLater(candidate: Message, current: Message): boolean {
+  const candidateTime = Date.parse(candidate.createdAt);
+  const currentTime = Date.parse(current.createdAt);
+  if (candidateTime !== currentTime) {
+    return candidateTime > currentTime;
+  }
+  return candidate.id.localeCompare(current.id) > 0;
+}
+
+/**
+ * Fold Buzz kind 40003 events into their original messages.
+ *
+ * Edit events carry full replacement content and a full `imeta` attachment
+ * set. Their `e` tag identifies the target; their `h`, `e`, and `p` tags are
+ * transport/notification metadata and must not rewrite the original message's
+ * channel, thread, or audience. Custom `emoji` tags are replaceable only when
+ * an edit supplies a new set, matching Buzz Desktop's compatibility behavior.
+ */
+export function reconcileBuzzMessageEdits(
+  messages: readonly Message[],
+): Message[] {
+  const editsByTarget = new Map<string, Message[]>();
+  for (const message of messages) {
+    if (message.kind !== BUZZ_MESSAGE_EDIT_KIND) {
+      continue;
+    }
+    const targetId = editTargetId(message);
+    if (!targetId) {
+      continue;
+    }
+    const edits = editsByTarget.get(targetId) ?? [];
+    edits.push(message);
+    editsByTarget.set(targetId, edits);
+  }
+
+  return messages.flatMap((original) => {
+    if (original.kind === BUZZ_MESSAGE_EDIT_KIND) {
+      return [];
+    }
+    const candidates = editsByTarget
+      .get(original.id)
+      ?.filter(
+        (edit) =>
+          !edit.channelId ||
+          !original.channelId ||
+          edit.channelId === original.channelId,
+      );
+    if (!candidates || candidates.length === 0) {
+      return [original];
+    }
+    const edit = candidates.reduce((latest, candidate) =>
+      editIsLater(candidate, latest) ? candidate : latest,
+    );
+    const editEmojiTags = edit.tags.filter((tag) => tag[0] === "emoji");
+    const originalTags = original.tags.filter(
+      (tag) =>
+        tag[0] !== "imeta" &&
+        (editEmojiTags.length === 0 || tag[0] !== "emoji"),
+    );
+    const editImetaTags = edit.tags.filter((tag) => tag[0] === "imeta");
+
+    return [
+      {
+        ...original,
+        content: edit.content,
+        tags: [...originalTags, ...editImetaTags, ...editEmojiTags],
+        attachments: edit.attachments.map((attachment) => ({ ...attachment })),
+      },
+    ];
+  });
+}
+
 export function normalizeMessagesResponse(
   input: unknown,
   options: NormalizeMessageOptions = {},
 ): Message[] {
-  return unwrapCliRows(input, ["messages", "events", "items"]).flatMap(
-    (value, index) => {
-      if (!isRecord(value)) {
-        return [];
-      }
-      const content = typeof value.content === "string" ? value.content : "";
-      const tags = normalizeTags(value.tags);
-      const createdAt = toIsoTimestamp(
-        value.created_at ?? value.createdAt ?? value.timestamp,
+  const messages = unwrapCliRows(input, [
+    "messages",
+    "events",
+    "items",
+  ]).flatMap((value, index) => {
+    if (!isRecord(value)) {
+      return [];
+    }
+    const content = typeof value.content === "string" ? value.content : "";
+    const tags = normalizeTags(value.tags);
+    const createdAt = toIsoTimestamp(
+      value.created_at ?? value.createdAt ?? value.timestamp,
+    );
+    const authorPubkey =
+      firstString(value, "pubkey", "author_pubkey", "authorPubkey") ?? "";
+    const id =
+      firstString(value, "id", "event_id", "eventId") ??
+      stableLocalId(
+        "message",
+        `${authorPubkey}:${createdAt}:${content}:${index}`,
       );
-      const authorPubkey =
-        firstString(value, "pubkey", "author_pubkey", "authorPubkey") ?? "";
-      const id =
-        firstString(value, "id", "event_id", "eventId") ??
-        stableLocalId(
-          "message",
-          `${authorPubkey}:${createdAt}:${content}:${index}`,
-        );
-      const references = nip10References(tags);
-      const explicitThreadId = firstString(value, "thread_id", "threadId");
-      const channelId =
-        firstString(value, "channel_id", "channelId") ??
-        tagValue(tags, "h") ??
-        options.channelId ??
-        "";
-      const authorName =
-        firstString(
-          value,
-          "author_name",
-          "authorName",
-          "display_name",
-          "name",
-        ) ??
-        options.authorNames?.[authorPubkey] ??
-        (authorPubkey ? `${authorPubkey.slice(0, 8)}…` : "Unknown");
+    const references = nip10References(tags);
+    const explicitThreadId = firstString(value, "thread_id", "threadId");
+    const channelId =
+      firstString(value, "channel_id", "channelId") ??
+      tagValue(tags, "h") ??
+      options.channelId ??
+      "";
+    const authorName =
+      firstString(value, "author_name", "authorName", "display_name", "name") ??
+      options.authorNames?.[authorPubkey] ??
+      (authorPubkey ? `${authorPubkey.slice(0, 8)}…` : "Unknown");
 
-      return [
-        {
-          id,
-          channelId,
-          content,
-          authorPubkey,
-          authorName,
-          createdAt,
-          kind: firstNumber(value, "kind") ?? 9,
-          tags,
-          attachments: normalizeAttachments(value, tags),
-          threadId:
-            explicitThreadId ?? references.rootId ?? options.threadId ?? id,
-          rootId: references.rootId ?? options.threadId ?? id,
-          replyToId: references.replyToId,
-          isMine:
-            asBoolean(value.isMine ?? value.is_mine) ??
-            Boolean(
-              options.ownerPubkey && options.ownerPubkey === authorPubkey,
-            ),
-        },
-      ];
-    },
-  );
+    return [
+      {
+        id,
+        channelId,
+        content,
+        authorPubkey,
+        authorName,
+        createdAt,
+        kind: firstNumber(value, "kind") ?? 9,
+        tags,
+        attachments: normalizeAttachments(value, tags),
+        threadId:
+          explicitThreadId ?? references.rootId ?? options.threadId ?? id,
+        rootId: references.rootId ?? options.threadId ?? id,
+        replyToId: references.replyToId,
+        isMine:
+          asBoolean(value.isMine ?? value.is_mine) ??
+          Boolean(options.ownerPubkey && options.ownerPubkey === authorPubkey),
+      },
+    ];
+  });
+  return messages;
 }
 
 function normalizePresence(value: unknown): AgentPresence {
@@ -495,6 +575,11 @@ function normalizeProject(
     name,
     description: firstString(value, "description") ?? "",
     color: firstString(value, "color") ?? "#D97757",
+    buzzChannelId: firstString(
+      value,
+      "buzzChannelId",
+      "buzz_channel_id",
+    )?.toLowerCase(),
     missionIds: stringArray(value.missionIds ?? value.mission_ids),
     createdAt: toIsoTimestamp(
       value.createdAt ?? value.created_at,
