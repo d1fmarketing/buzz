@@ -2,6 +2,8 @@
 /target/
 /dist/
 /admin-web/dist/
+/cockpit/dist/
+/cockpit/.vite/
 
 # Python cache
 __pycache__/
