@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useMemo, useState, type FormEvent } from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -7,6 +7,9 @@ import {
   FlaskConical,
   FolderPlus,
   GitBranch,
+  Images,
+  LoaderCircle,
+  MessageSquareMore,
   Plus,
   Settings2,
   Sparkles,
@@ -16,6 +19,7 @@ import type {
   AttentionItem,
   ChannelSummary,
   CockpitState,
+  Message,
   Mission,
   Project,
 } from "../domain";
@@ -34,6 +38,12 @@ import {
   presenceLabel,
 } from "./status";
 import type { CockpitMode } from "./Shell";
+import {
+  messagesToTimelineEntries,
+  Timeline,
+  timelineEntryHasMedia,
+} from "./Timeline";
+import { updateSearchParam } from "./router";
 
 export function SampleBanner() {
   return (
@@ -212,10 +222,10 @@ export function HomeView({
           <span className="eyebrow">
             <Sparkles size={13} aria-hidden="true" /> Venture Studio
           </span>
-          <h1>O trabalho em curso, sem a inbox.</h1>
+          <h1>Projetos organizados. Conversas sempre visíveis.</h1>
           <p>
-            Projetos, missões e respostas do Buzz organizados pelo caminho que o
-            trabalho percorreu.
+            Acompanhe cada fala, thread, handoff e artefato do Buzz pelo caminho
+            que o trabalho percorreu.
           </p>
         </div>
         {mode === "operator" ? (
@@ -280,6 +290,164 @@ export function HomeView({
           <AttentionRows items={openAttention.slice(0, 3)} state={state} />
         </section>
       ) : null}
+    </div>
+  );
+}
+
+type ActivityScope = "all" | "handoffs" | "media";
+
+const ACTIVITY_MESSAGE_KINDS = new Set([9, 40002, 40008, 45001, 45003]);
+
+export function ActivityView({
+  messages,
+  agents,
+  channels,
+  state,
+  loading,
+  error,
+  selectedAgentPubkey,
+}: {
+  messages: Message[];
+  agents: AgentSummary[];
+  channels: ChannelSummary[];
+  state: CockpitState;
+  loading: boolean;
+  error?: string;
+  selectedAgentPubkey?: string;
+}) {
+  const [scope, setScope] = useState<ActivityScope>("all");
+  const entries = useMemo(() => {
+    const messageById = new Map(
+      messages
+        .filter(
+          (message) =>
+            ACTIVITY_MESSAGE_KINDS.has(message.kind) &&
+            Boolean(message.content.trim() || message.attachments.length),
+        )
+        .map((message) => [message.id, message]),
+    );
+    return messagesToTimelineEntries([...messageById.values()], agents).map(
+      (entry) => {
+        const source = messageById.get(entry.id);
+        const channel = channels.find(
+          (candidate) => candidate.id === source?.channelId,
+        );
+        const rootId = source?.rootId ?? source?.threadId;
+        const mission = state.missions.find((candidate) => {
+          if (candidate.conversationRefs?.length) {
+            return candidate.conversationRefs.some(
+              (conversation) =>
+                conversation.channelId === source?.channelId &&
+                (!conversation.rootEventId ||
+                  conversation.rootEventId === rootId),
+            );
+          }
+          return candidate.channelId === source?.channelId;
+        });
+        const project = state.projects.find(
+          (candidate) => candidate.id === mission?.projectId,
+        );
+        return {
+          ...entry,
+          contextLabel: mission
+            ? `${project?.name ?? "Projeto"} · ${mission.title}`
+            : `#${channel?.name ?? `canal ${compactId(source?.channelId ?? "")}`}`,
+          contextHref: mission
+            ? `/projects/${encodeURIComponent(mission.projectId)}/missions/${encodeURIComponent(mission.id)}`
+            : undefined,
+        };
+      },
+    );
+  }, [agents, channels, messages, state.missions, state.projects]);
+
+  const visibleEntries = entries.filter((entry) => {
+    if (
+      selectedAgentPubkey &&
+      entry.authorPubkey !== selectedAgentPubkey &&
+      !entry.mentions?.some((mention) => mention.pubkey === selectedAgentPubkey)
+    ) {
+      return false;
+    }
+    if (scope === "media") return timelineEntryHasMedia(entry);
+    if (scope === "handoffs")
+      return Boolean(entry.handoffTargetPubkeys?.length);
+    return true;
+  });
+
+  return (
+    <div className="page page--activity">
+      <header className="page-heading activity-heading">
+        <div className="page-heading__copy">
+          <span className="eyebrow">
+            <MessageSquareMore size={13} aria-hidden="true" /> Buzz ao vivo
+          </span>
+          <h1>A conversa do time, em sequência.</h1>
+          <p>
+            Histórico recente dos canais e DMs, com falas, menções, handoffs e
+            arquivos. Somente exceções entram em Atenção.
+          </p>
+        </div>
+        <label className="activity-agent-filter">
+          <span>Ver conversa de</span>
+          <select
+            value={selectedAgentPubkey ?? ""}
+            onChange={(event) =>
+              updateSearchParam("agent", event.target.value || undefined)
+            }
+          >
+            <option value="">Todos os agentes</option>
+            {agents.map((agent) => (
+              <option value={agent.pubkey || agent.id} key={agent.id}>
+                {agent.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      </header>
+
+      <fieldset className="activity-toolbar" aria-label="Filtros de atividade">
+        <button
+          type="button"
+          className={scope === "all" ? "is-active" : undefined}
+          aria-pressed={scope === "all"}
+          onClick={() => setScope("all")}
+        >
+          <MessageSquareMore size={14} aria-hidden="true" /> Todas
+          <span>{entries.length}</span>
+        </button>
+        <button
+          type="button"
+          className={scope === "handoffs" ? "is-active" : undefined}
+          aria-pressed={scope === "handoffs"}
+          onClick={() => setScope("handoffs")}
+        >
+          <GitBranch size={14} aria-hidden="true" /> Handoffs
+        </button>
+        <button
+          type="button"
+          className={scope === "media" ? "is-active" : undefined}
+          aria-pressed={scope === "media"}
+          onClick={() => setScope("media")}
+        >
+          <Images size={14} aria-hidden="true" /> Imagens e arquivos
+        </button>
+      </fieldset>
+
+      {error ? (
+        <div className="mission-alert" role="alert">
+          <AlertTriangle size={15} aria-hidden="true" /> {error}
+        </div>
+      ) : null}
+      {loading && entries.length === 0 ? (
+        <div className="empty-state" aria-live="polite">
+          <LoaderCircle className="spin" size={20} aria-hidden="true" />
+          <p>Lendo a atividade real do Buzz…</p>
+        </div>
+      ) : (
+        <section className="activity-stream" aria-label="Atividade do Buzz">
+          <Timeline entries={visibleEntries} order="newest" />
+        </section>
+      )}
     </div>
   );
 }
@@ -697,6 +865,12 @@ export function AgentsView({
                   {mission || project ? (
                     <p>{mission?.title ?? project?.name}</p>
                   ) : null}
+                  <InternalLink
+                    href={`/activity?agent=${encodeURIComponent(agent.pubkey || agent.id)}`}
+                    className="agent-row__conversation"
+                  >
+                    Ver falas <ArrowRight size={12} aria-hidden="true" />
+                  </InternalLink>
                 </div>
               </li>
             );
@@ -769,7 +943,7 @@ export function AttentionView({ state }: { state: CockpitState }) {
           <span className="eyebrow">
             <CircleAlert size={13} aria-hidden="true" /> Exceções
           </span>
-          <h1>Atenção, não outra inbox.</h1>
+          <h1>Só o que exige uma decisão.</h1>
           <p>
             Apenas bloqueios, timeouts, falhas, decisões e handoffs que precisam
             de leitura.

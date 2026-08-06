@@ -83,6 +83,21 @@ describe("mission dispatch guard", () => {
     ).toMatchObject({ allowed: false, code: "handoff_depth" });
   });
 
+  it("keeps the selected Buzz channel on a dispatch", () => {
+    const { state, mission } = missionFixture();
+    const channelId = "11111111-2222-3333-4444-555555555555";
+    const next = upsertDispatch(state, {
+      id: "dispatch-with-channel",
+      missionId: mission.id,
+      agentId: TARGET,
+      agentName: "Honey",
+      status: "sent",
+      channelId,
+    });
+
+    expect(next.dispatches[0]?.channelId).toBe(channelId);
+  });
+
   it("blocks a seventeenth dispatch", () => {
     let { state, mission } = missionFixture();
     for (let index = 0; index < mission.limits.maxDispatches; index += 1) {

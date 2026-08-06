@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
   access,
@@ -21,6 +22,7 @@ export const DEFAULT_PORT = 4317;
 export const MAX_STATE_BYTES = 1024 * 1024;
 export const MAX_ATTACHMENTS_BYTES = 25 * 1024 * 1024;
 export const MAX_MESSAGE_BODY_BYTES = 36 * 1024 * 1024;
+export const MAX_MEDIA_BYTES = 25 * 1024 * 1024;
 
 const DEFAULT_STATE = Object.freeze({
   version: 1,
@@ -32,6 +34,7 @@ const DEFAULT_STATE = Object.freeze({
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const HEX_64_RE = /^[0-9a-f]{64}$/i;
+const MEDIA_FILENAME_RE = /^([0-9a-f]{64})\.([a-z0-9]{1,8})$/;
 const BASE64_RE =
   /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const DANGEROUS_STATE_KEYS = new Set(["__proto__", "prototype", "constructor"]);
@@ -319,6 +322,27 @@ export function requireEventId(value, field = "event") {
   if (!HEX_64_RE.test(string))
     badRequest(`${field} must be a 64-character hex event id`);
   return string.toLowerCase();
+}
+
+/** Accept only a lowercase Blossom content hash followed by one safe extension. */
+export function validateMediaFilename(value) {
+  const filename = requireString(value, "media filename", {
+    min: 66,
+    max: 73,
+  });
+  const match = MEDIA_FILENAME_RE.exec(filename);
+  if (!match) {
+    badRequest(
+      "media filename must be a lowercase sha256 followed by one file extension",
+    );
+  }
+  return { filename, sha256: match[1], extension: match[2] };
+}
+
+/** Build the one binary-output CLI command exposed by the media route. */
+export function buildMediaCliInvocation(value) {
+  const { filename } = validateMediaFilename(value);
+  return { args: ["media", "get", filename] };
 }
 
 function optionalInteger(
@@ -689,6 +713,98 @@ export function executeCli({
   });
 }
 
+/** Execute the fixed media command while preserving stdout as bytes. */
+export function executeCliBytes({
+  cliPath,
+  args,
+  env,
+  secrets = [],
+  maxBytes = MAX_MEDIA_BYTES,
+  timeoutMs = 120_000,
+}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cliPath, args, {
+      env,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout = [];
+    const stderr = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let outputTooLarge = false;
+
+    const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
+    timer.unref();
+
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > maxBytes) {
+        outputTooLarge = true;
+        child.kill("SIGTERM");
+        return;
+      }
+      stdout.push(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes > 2 * 1024 * 1024) {
+        outputTooLarge = true;
+        child.kill("SIGTERM");
+        return;
+      }
+      stderr.push(chunk);
+    });
+    child.once("error", () => {
+      clearTimeout(timer);
+      reject(
+        new AdapterError(
+          502,
+          "CLI_UNAVAILABLE",
+          "Buzz CLI could not be started",
+        ),
+      );
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (outputTooLarge) {
+        reject(
+          new AdapterError(
+            413,
+            "MEDIA_TOO_LARGE",
+            "Buzz media exceeds the 25 MB response limit",
+          ),
+        );
+        return;
+      }
+      const cleanErr = redactSecretText(
+        Buffer.concat(stderr).toString("utf8"),
+        secrets,
+      );
+      if (code !== 0) {
+        let parsed;
+        try {
+          parsed = JSON.parse(cleanErr.trim());
+        } catch {
+          parsed = null;
+        }
+        const message =
+          parsed?.message ||
+          cleanErr.trim() ||
+          `Buzz CLI exited with ${signal ?? code}`;
+        reject(
+          new AdapterError(cliStatus(code), "CLI_ERROR", message, {
+            category: parsed?.error ?? "cli",
+            exitCode: code,
+          }),
+        );
+        return;
+      }
+      resolve(Buffer.concat(stdout));
+    });
+  });
+}
+
 export async function runBuzzOperation(operation, input, runtime) {
   if (!runtime.cliPath) {
     throw new AdapterError(503, "CLI_UNAVAILABLE", "Buzz CLI is unavailable");
@@ -735,6 +851,62 @@ export async function runBuzzOperation(operation, input, runtime) {
     env: childEnv,
     secrets: [privateKey, authTag].filter(Boolean),
   });
+}
+
+/** Download one content-addressed relay blob with the existing owner identity. */
+export async function runBuzzMedia(value, runtime) {
+  if (!runtime.cliPath) {
+    throw new AdapterError(503, "CLI_UNAVAILABLE", "Buzz CLI is unavailable");
+  }
+  if (!runtime.relayUrl) {
+    throw new AdapterError(
+      503,
+      "RELAY_UNAVAILABLE",
+      "Buzz relay is not configured",
+    );
+  }
+  if (!runtime.privateKey) {
+    throw new AdapterError(
+      503,
+      "IDENTITY_UNAVAILABLE",
+      "Buzz identity is unavailable",
+    );
+  }
+
+  const descriptor = validateMediaFilename(value);
+  const invocation = buildMediaCliInvocation(descriptor.filename);
+  const childEnv = {
+    ...process.env,
+    BUZZ_RELAY_URL: runtime.relayUrl,
+    BUZZ_PRIVATE_KEY: runtime.privateKey,
+  };
+  if (runtime.authTag) childEnv.BUZZ_AUTH_TAG = runtime.authTag;
+  else delete childEnv.BUZZ_AUTH_TAG;
+
+  const execute = runtime.executeCliBytes ?? executeCliBytes;
+  const bytes = await execute({
+    cliPath: runtime.cliPath,
+    ...invocation,
+    env: childEnv,
+    secrets: [runtime.privateKey, runtime.authTag].filter(Boolean),
+    maxBytes: MAX_MEDIA_BYTES,
+  });
+  if (!Buffer.isBuffer(bytes) || bytes.length > MAX_MEDIA_BYTES) {
+    throw new AdapterError(
+      502,
+      "CLI_INVALID_MEDIA",
+      "Buzz CLI returned invalid media bytes",
+    );
+  }
+  const actualHash = createHash("sha256").update(bytes).digest("hex");
+  if (actualHash !== descriptor.sha256) {
+    throw new AdapterError(
+      502,
+      "MEDIA_HASH_MISMATCH",
+      "Buzz media did not match its content hash",
+    );
+  }
+  return bytes;
 }
 
 function decodeAttachment(attachment, index) {

@@ -62,8 +62,9 @@ export function handleInternalLink(
   navigate(`${url.pathname}${url.search}${url.hash}`);
 }
 
-export function updateSearchParam(key: string, value: string): void {
+export function updateSearchParam(key: string, value?: string): void {
   const url = new URL(window.location.href);
-  url.searchParams.set(key, value);
+  if (value) url.searchParams.set(key, value);
+  else url.searchParams.delete(key);
   navigate(`${url.pathname}${url.search}`, { replace: true });
 }

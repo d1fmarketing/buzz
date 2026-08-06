@@ -8,6 +8,7 @@ import {
   MAX_STATE_BYTES,
   readSafeAgents,
   readState,
+  runBuzzMedia,
   runBuzzOperation,
   withTempAttachments,
   writeState,
@@ -26,6 +27,25 @@ const MIME_TYPES = new Map([
   [".woff2", "font/woff2"],
 ]);
 
+const MEDIA_MIME_TYPES = new Map([
+  ["avif", "image/avif"],
+  ["gif", "image/gif"],
+  ["heic", "image/heic"],
+  ["jpeg", "image/jpeg"],
+  ["jpg", "image/jpeg"],
+  ["png", "image/png"],
+  ["webp", "image/webp"],
+  ["m4v", "video/x-m4v"],
+  ["mov", "video/quicktime"],
+  ["mp4", "video/mp4"],
+  ["webm", "video/webm"],
+  ["m4a", "audio/mp4"],
+  ["mp3", "audio/mpeg"],
+  ["ogg", "audio/ogg"],
+  ["wav", "audio/wav"],
+  ["pdf", "application/pdf"],
+]);
+
 function setSecurityHeaders(response) {
   response.setHeader("X-Content-Type-Options", "nosniff");
   response.setHeader("Referrer-Policy", "no-referrer");
@@ -41,6 +61,22 @@ export function sendJson(response, status, value) {
     "Content-Length": Buffer.byteLength(body),
   });
   response.end(body);
+}
+
+function sendMedia(response, method, filename, bytes) {
+  const extension = filename.slice(filename.lastIndexOf(".") + 1);
+  const contentType =
+    MEDIA_MIME_TYPES.get(extension) ?? "application/octet-stream";
+  setSecurityHeaders(response);
+  response.writeHead(200, {
+    "Cache-Control": "private, max-age=31536000, immutable",
+    "Content-Disposition": `inline; filename="${filename}"`,
+    "Content-Type": contentType,
+    "Content-Length": bytes.length,
+    "Cross-Origin-Resource-Policy": "same-origin",
+  });
+  if (method === "HEAD") response.end();
+  else response.end(bytes);
 }
 
 function publicError(error) {
@@ -251,6 +287,14 @@ export async function handleApiRequest(request, response, runtime) {
       return true;
     }
 
+    const mediaMatch = url.pathname.match(/^\/api\/media\/([^/]+)$/);
+    if ((request.method === "GET" || request.method === "HEAD") && mediaMatch) {
+      const filename = decodeRoutePart(mediaMatch[1], "media filename");
+      const bytes = await runtime.runMedia(filename, runtime);
+      sendMedia(response, request.method, filename, bytes);
+      return true;
+    }
+
     if (request.method === "GET" && url.pathname === "/api/state") {
       sendJson(response, 200, await readState(runtime.statePath));
       return true;
@@ -374,6 +418,7 @@ export async function createCockpitServer({
   viteFactory,
 } = {}) {
   runtime.runOperation ??= runBuzzOperation;
+  runtime.runMedia ??= runBuzzMedia;
   let vite;
   if (dev) {
     const createVite = viteFactory ?? (await import("vite")).createServer;

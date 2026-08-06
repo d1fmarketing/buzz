@@ -21,22 +21,34 @@ export interface ComposerAgent {
 
 export interface ComposerSubmission {
   agentPubkey: string;
+  channelId: string;
+  destinationId: string;
+  replyTo?: string;
   content: string;
   files: File[];
   parentDispatchId?: string;
   depth?: number;
 }
 
+export interface ComposerDestination {
+  id: string;
+  label: string;
+  channelId: string;
+  replyTo?: string;
+}
+
 export function Composer({
   agents,
-  destination,
+  destinations,
+  preferredDestinationId,
   preferredAgentPubkey,
   disabled,
   sending,
   onSend,
 }: {
   agents: ComposerAgent[];
-  destination?: string;
+  destinations: ComposerDestination[];
+  preferredDestinationId?: string;
   preferredAgentPubkey?: string;
   disabled?: boolean;
   sending?: boolean;
@@ -44,6 +56,7 @@ export function Composer({
 }) {
   const [content, setContent] = useState("");
   const [agentPubkey, setAgentPubkey] = useState(agents[0]?.pubkey ?? "");
+  const [destinationId, setDestinationId] = useState(destinations[0]?.id ?? "");
   const [files, setFiles] = useState<File[]>([]);
   const [localError, setLocalError] = useState<string>();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -62,17 +75,44 @@ export function Composer({
     }
   }, [agentPubkey, agents, preferredAgentPubkey]);
 
+  useEffect(() => {
+    if (
+      preferredDestinationId &&
+      destinations.some(
+        (destination) => destination.id === preferredDestinationId,
+      )
+    ) {
+      setDestinationId(preferredDestinationId);
+      return;
+    }
+    if (!destinations.some((destination) => destination.id === destinationId)) {
+      setDestinationId(destinations[0]?.id ?? "");
+    }
+  }, [destinationId, destinations, preferredDestinationId]);
+
   const canSend =
     Boolean(content.trim() || files.length > 0) &&
     Boolean(agentPubkey) &&
+    Boolean(destinationId) &&
     !disabled &&
     !sending;
 
   async function submit() {
     if (!canSend) return;
+    const destination = destinations.find(
+      (candidate) => candidate.id === destinationId,
+    );
+    if (!destination) return;
     setLocalError(undefined);
     try {
-      await onSend({ agentPubkey, content: content.trim(), files });
+      await onSend({
+        agentPubkey,
+        channelId: destination.channelId,
+        destinationId: destination.id,
+        replyTo: destination.replyTo,
+        content: content.trim(),
+        files,
+      });
       setContent("");
       setFiles([]);
     } catch (error) {
@@ -105,9 +145,24 @@ export function Composer({
             ))}
           </select>
         </label>
-        {destination ? (
-          <span className="composer__destination">em {destination}</span>
-        ) : null}
+        <span>na conversa</span>
+        <label className="destination-select">
+          <span className="sr-only">Escolher conversa de destino</span>
+          <select
+            value={destinationId}
+            disabled={disabled || sending || destinations.length === 0}
+            onChange={(event) => setDestinationId(event.target.value)}
+          >
+            {destinations.length === 0 ? (
+              <option value="">Nenhuma conversa vinculada</option>
+            ) : null}
+            {destinations.map((destination) => (
+              <option value={destination.id} key={destination.id}>
+                {destination.label}
+              </option>
+            ))}
+          </select>
+        </label>
       </div>
 
       <label className="sr-only" htmlFor={textareaId}>

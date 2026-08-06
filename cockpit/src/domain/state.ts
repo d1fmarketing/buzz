@@ -5,6 +5,7 @@ import type {
   Dispatch,
   DispatchReceipt,
   Mission,
+  MissionConversationRef,
   Project,
 } from "./types";
 
@@ -134,6 +135,7 @@ export function createMission(
     status: "draft",
     channelId: input.channelId,
     threadIds: [],
+    conversationRefs: [],
     agentIds: [...new Set(input.agentIds ?? [])],
     dispatchIds: [],
     limits: { ...copyDefaultLimits(), ...input.limits },
@@ -181,6 +183,19 @@ export function updateMission(
     threadIds: patch.threadIds
       ? [...new Set(patch.threadIds)]
       : current.threadIds,
+    conversationRefs: patch.conversationRefs
+      ? [
+          ...new Map(
+            patch.conversationRefs.map((conversation) => [
+              conversation.id,
+              {
+                ...conversation,
+                agentIds: [...new Set(conversation.agentIds)],
+              },
+            ]),
+          ).values(),
+        ]
+      : current.conversationRefs,
     agentIds: patch.agentIds ? [...new Set(patch.agentIds)] : current.agentIds,
     dispatchIds: patch.dispatchIds
       ? [...new Set(patch.dispatchIds)]
@@ -221,11 +236,77 @@ export function linkThread(
   if (mission.threadIds.includes(normalizedThreadId)) {
     return state;
   }
+  const timestamp = nowIso(now);
+  const conversationRefs = mission.channelId
+    ? [
+        ...(mission.conversationRefs ?? []),
+        {
+          id: `${mission.channelId}:${normalizedThreadId}`,
+          channelId: mission.channelId,
+          rootEventId: normalizedThreadId,
+          agentIds: [],
+          linkedAt: timestamp,
+        },
+      ]
+    : mission.conversationRefs;
   return updateMission(
     state,
     missionId,
-    { threadIds: [...mission.threadIds, normalizedThreadId] },
-    now,
+    {
+      threadIds: [...mission.threadIds, normalizedThreadId],
+      conversationRefs,
+    },
+    timestamp,
+  );
+}
+
+export function linkConversation(
+  state: CockpitState,
+  missionId: string,
+  input: Omit<MissionConversationRef, "id" | "linkedAt"> & {
+    id?: string;
+    linkedAt?: string;
+  },
+  now?: string,
+): CockpitState {
+  const mission = state.missions.find(({ id }) => id === missionId);
+  if (!mission) throw new Error(`Mission ${missionId} does not exist`);
+  const timestamp = input.linkedAt ?? nowIso(now);
+  const id =
+    input.id ?? `${input.channelId}:${input.rootEventId ?? "channel-root"}`;
+  const conversation: MissionConversationRef = {
+    ...input,
+    id,
+    linkedAt: timestamp,
+    agentIds: [...new Set(input.agentIds)],
+  };
+  const refs = mission.conversationRefs ?? [];
+  const existing = refs.find((candidate) => candidate.id === id);
+  const mergedConversation = existing
+    ? {
+        ...existing,
+        ...conversation,
+        label: conversation.label ?? existing.label,
+        agentIds: [
+          ...new Set([...existing.agentIds, ...conversation.agentIds]),
+        ],
+      }
+    : conversation;
+  const nextRefs = existing
+    ? refs.map((candidate) =>
+        candidate.id === id ? mergedConversation : candidate,
+      )
+    : [...refs, conversation];
+  return updateMission(
+    state,
+    missionId,
+    {
+      conversationRefs: nextRefs,
+      threadIds: input.rootEventId
+        ? [...mission.threadIds, input.rootEventId]
+        : mission.threadIds,
+    },
+    timestamp,
   );
 }
 
@@ -280,6 +361,7 @@ export function upsertDispatch(
       ...new Set(input.proposedAgentIds ?? existing?.proposedAgentIds ?? []),
     ],
     parentDispatchId: input.parentDispatchId ?? existing?.parentDispatchId,
+    channelId: input.channelId ?? existing?.channelId,
     threadId: input.threadId ?? existing?.threadId,
     eventId: input.eventId ?? existing?.eventId,
     responseEventId: input.responseEventId ?? existing?.responseEventId,

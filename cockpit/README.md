@@ -12,7 +12,14 @@ It never reads an OpenAI, Anthropic or other LLM API key.
 ## Included in this first delivery
 
 - project and mission organization in one local JSON file;
-- readable Buzz thread timeline with Markdown and attachments;
+- global Activity stream with the real Buzz conversation, grouped by channel
+  context and filterable by agent, handoff, or media;
+- readable Buzz thread timeline with Markdown, reply context, mentions, and
+  exact event/thread references;
+- inline image galleries, native video, file cards, and full-screen image
+  navigation backed by the existing authenticated `buzz media get` command;
+- multiple channel or DM conversation references per mission, with a unified
+  timeline and per-agent conversation views;
 - chronological Chain with distinct send, relay, work, response and handoff
   receipts;
 - Reader and Operator modes;
@@ -65,9 +72,9 @@ BUZZ_CLI_PATH=/path/to/buzz
 BUZZ_COCKPIT_STATE_PATH=/path/to/state.json
 ```
 
-Projects, missions, thread links, and visual loop state live in one local JSON
-file under the user's Application Support directory. Messages, replies, files,
-presence, and profiles remain in Buzz.
+Projects, missions, conversation links, and visual loop state live in one
+local JSON file under the user's Application Support directory. Messages,
+replies, files, presence, and profiles remain in Buzz.
 
 The adapter binds only to `127.0.0.1`, uses `spawn(..., { shell: false })`, and
 has no endpoint for arbitrary shell commands.

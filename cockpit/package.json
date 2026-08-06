@@ -7,7 +7,7 @@
     "dev": "node ./server/index.mjs --dev",
     "build": "tsc --noEmit && vite build",
     "preview": "node ./server/index.mjs",
-    "test": "node --test ./server/*.test.mjs && vitest run src/domain",
+    "test": "node --test ./server/*.test.mjs && vitest run src/domain src/data src/ui/Timeline.test.ts",
     "lint": "biome lint .",
     "format": "biome format --write .",
     "check": "biome check . && pnpm test && pnpm build"

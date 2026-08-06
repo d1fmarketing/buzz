@@ -55,6 +55,16 @@ export interface Project {
   isSample?: boolean;
 }
 
+export interface MissionConversationRef {
+  id: string;
+  channelId: string;
+  rootEventId?: string;
+  label?: string;
+  agentIds: string[];
+  linkedAt: string;
+  dispatchId?: string;
+}
+
 export interface Mission {
   id: string;
   projectId: string;
@@ -64,6 +74,7 @@ export interface Mission {
   status: MissionStatus;
   channelId?: string;
   threadIds: string[];
+  conversationRefs?: MissionConversationRef[];
   agentIds: string[];
   dispatchIds: string[];
   limits: MissionLimits;
@@ -94,6 +105,7 @@ export interface Dispatch {
   retryCount: number;
   proposedAgentIds: string[];
   parentDispatchId?: string;
+  channelId?: string;
   threadId?: string;
   eventId?: string;
   responseEventId?: string;
@@ -138,9 +150,11 @@ export interface AttachmentSummary {
   id: string;
   name: string;
   url?: string;
+  thumbnailUrl?: string;
   mimeType?: string;
   size?: number;
   sha256?: string;
+  dimensions?: string;
 }
 
 export interface Message {

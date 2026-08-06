@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
@@ -24,10 +25,18 @@ async function request(port, pathname, options = {}) {
         const chunks = [];
         response.on("data", (chunk) => chunks.push(chunk));
         response.on("end", () => {
-          const text = Buffer.concat(chunks).toString("utf8");
+          const raw = Buffer.concat(chunks);
+          const text = raw.toString("utf8");
+          const contentType = response.headers["content-type"] ?? "";
           resolve({
             status: response.statusCode,
-            body: text ? JSON.parse(text) : null,
+            body:
+              raw.length === 0
+                ? null
+                : contentType.startsWith("application/json")
+                  ? JSON.parse(text)
+                  : raw,
+            headers: response.headers,
           });
         });
       },
@@ -164,3 +173,61 @@ async function readFileForTest(file) {
   const { readFile } = await import("node:fs/promises");
   return readFile(file);
 }
+
+test("media GET and HEAD return verified bytes through the fixed Buzz CLI path", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "buzz-media-test-"));
+  const bytes = Buffer.from("generated image bytes");
+  const hash = createHash("sha256").update(bytes).digest("hex");
+  const filename = `${hash}.png`;
+  const invocations = [];
+  const runtime = {
+    cliPath: "/fake/buzz",
+    relayUrl: "https://relay.example",
+    privateKey: "owner-private-key",
+    authTag: "owner-auth-tag",
+    agentsPath: path.join(directory, "agents.json"),
+    statePath: path.join(directory, "state.json"),
+    executeCliBytes: async (input) => {
+      invocations.push(input);
+      return bytes;
+    },
+  };
+  const server = await createCockpitServer({ rootDir: directory, runtime });
+  const port = await listen(server);
+  try {
+    const get = await request(port, `/api/media/${filename}`);
+    assert.equal(get.status, 200);
+    assert.deepEqual(get.body, bytes);
+    assert.equal(get.headers["content-type"], "image/png");
+    assert.equal(get.headers["content-length"], String(bytes.length));
+    assert.equal(
+      get.headers["cache-control"],
+      "private, max-age=31536000, immutable",
+    );
+    assert.equal(get.headers["cross-origin-resource-policy"], "same-origin");
+    assert.deepEqual(invocations[0].args, ["media", "get", filename]);
+    assert.equal(invocations[0].env.BUZZ_PRIVATE_KEY, runtime.privateKey);
+    assert.equal(invocations[0].env.BUZZ_AUTH_TAG, runtime.authTag);
+
+    const head = await request(port, `/api/media/${filename}`, {
+      method: "HEAD",
+    });
+    assert.equal(head.status, 200);
+    assert.equal(head.body, null);
+    assert.equal(head.headers["content-type"], "image/png");
+    assert.equal(head.headers["content-length"], String(bytes.length));
+    assert.equal(invocations.length, 2);
+
+    const unknown = await request(port, `/api/media/${hash}.html`);
+    assert.equal(unknown.status, 200);
+    assert.equal(unknown.headers["content-type"], "application/octet-stream");
+
+    const invalid = await request(port, `/api/media/${hash}.png%2Fextra`);
+    assert.equal(invalid.status, 400);
+    assert.equal(invalid.body.error.code, "INVALID_REQUEST");
+    assert.equal(invocations.length, 3);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});

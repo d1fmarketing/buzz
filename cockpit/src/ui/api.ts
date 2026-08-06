@@ -89,7 +89,7 @@ export const cockpitApi = {
     request<unknown>(`/api/channels/${encodeURIComponent(channelId)}`),
   channelMembers: (channelId: string) =>
     request<unknown>(`/api/channels/${encodeURIComponent(channelId)}/members`),
-  messages: (channelId: string, limit = 120) =>
+  messages: (channelId: string, limit = 200) =>
     request<unknown>(
       `/api/channels/${encodeURIComponent(channelId)}/messages?limit=${encodeURIComponent(limit)}`,
     ),

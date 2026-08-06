@@ -1,18 +1,23 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
   AdapterError,
+  buildMediaCliInvocation,
   buildCliInvocation,
+  executeCliBytes,
   parseKeychainSecretStore,
   projectSafeAgents,
   readState,
   redactSecretText,
+  runBuzzMedia,
   runBuzzOperation,
   selectAgentDraftCredentials,
   validateState,
+  validateMediaFilename,
   withTempAttachments,
   writeState,
 } from "./adapter.mjs";
@@ -20,6 +25,9 @@ import {
 const CHANNEL = "11111111-2222-3333-4444-555555555555";
 const EVENT = "a".repeat(64);
 const PUBKEY = "b".repeat(64);
+const MEDIA_BYTES = Buffer.from("authenticated cockpit media");
+const MEDIA_HASH = createHash("sha256").update(MEDIA_BYTES).digest("hex");
+const MEDIA_FILENAME = `${MEDIA_HASH}.png`;
 
 test("CLI operation allowlist builds arrays and keeps message content on stdin", () => {
   const invocation = buildCliInvocation("messages:send", {
@@ -85,6 +93,72 @@ test("CLI validation rejects invalid route values and limits", () => {
   assert.deepEqual(
     buildCliInvocation("channels:get", { channelId: CHANNEL }).args.slice(2),
     ["channels", "get", "--channel", CHANNEL],
+  );
+});
+
+test("media filename and CLI invocation allow only one exact content-addressed path", () => {
+  assert.deepEqual(validateMediaFilename(MEDIA_FILENAME), {
+    filename: MEDIA_FILENAME,
+    sha256: MEDIA_HASH,
+    extension: "png",
+  });
+  assert.deepEqual(buildMediaCliInvocation(MEDIA_FILENAME), {
+    args: ["media", "get", MEDIA_FILENAME],
+  });
+  for (const invalid of [
+    MEDIA_HASH,
+    `${MEDIA_HASH.toUpperCase()}.png`,
+    `${MEDIA_HASH}.thumb.jpg`,
+    `${MEDIA_HASH}.png/extra`,
+    `https://relay.example/media/${MEDIA_FILENAME}`,
+    `${MEDIA_HASH}.toolongext`,
+  ]) {
+    assert.throws(
+      () => validateMediaFilename(invalid),
+      (error) =>
+        error instanceof AdapterError && error.code === "INVALID_REQUEST",
+      `expected rejection for ${invalid}`,
+    );
+  }
+});
+
+test("media read uses owner credentials and verifies returned content", async () => {
+  const seen = [];
+  const runtime = {
+    cliPath: "/fake/buzz",
+    relayUrl: "https://relay.example",
+    privateKey: "owner-private-key",
+    authTag: "owner-auth-tag",
+    executeCliBytes: async (input) => {
+      seen.push(input);
+      return MEDIA_BYTES;
+    },
+  };
+
+  assert.deepEqual(await runBuzzMedia(MEDIA_FILENAME, runtime), MEDIA_BYTES);
+  assert.deepEqual(seen[0].args, ["media", "get", MEDIA_FILENAME]);
+  assert.equal(seen[0].env.BUZZ_RELAY_URL, runtime.relayUrl);
+  assert.equal(seen[0].env.BUZZ_PRIVATE_KEY, runtime.privateKey);
+  assert.equal(seen[0].env.BUZZ_AUTH_TAG, runtime.authTag);
+  assert.deepEqual(seen[0].secrets, [runtime.privateKey, runtime.authTag]);
+
+  await assert.rejects(
+    runBuzzMedia(`${"a".repeat(64)}.png`, runtime),
+    (error) =>
+      error instanceof AdapterError && error.code === "MEDIA_HASH_MISMATCH",
+  );
+});
+
+test("binary CLI execution stops when media exceeds its byte cap", async () => {
+  await assert.rejects(
+    executeCliBytes({
+      cliPath: process.execPath,
+      args: ["-e", "process.stdout.write(Buffer.alloc(32))"],
+      env: process.env,
+      maxBytes: 16,
+    }),
+    (error) =>
+      error instanceof AdapterError && error.code === "MEDIA_TOO_LARGE",
   );
 });
 

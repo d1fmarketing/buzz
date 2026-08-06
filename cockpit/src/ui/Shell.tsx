@@ -5,6 +5,7 @@ import {
   ChevronRight,
   FolderKanban,
   LayoutDashboard,
+  MessageSquareMore,
   RefreshCw,
 } from "lucide-react";
 import type { CockpitState } from "../domain";
@@ -16,7 +17,14 @@ export type CockpitMode = "reader" | "operator";
 export type MissionViewMode = "conversation" | "chain";
 
 export interface RouteDescriptor {
-  kind: "home" | "project" | "mission" | "agents" | "attention" | "not-found";
+  kind:
+    | "home"
+    | "activity"
+    | "project"
+    | "mission"
+    | "agents"
+    | "attention"
+    | "not-found";
   projectId?: string;
   missionId?: string;
 }
@@ -55,6 +63,17 @@ export function ProjectRail({
         >
           <LayoutDashboard size={15} aria-hidden="true" />
           Visão geral
+        </InternalLink>
+        <InternalLink
+          href="/activity"
+          className={
+            route.kind === "activity"
+              ? "rail-nav__item is-active"
+              : "rail-nav__item"
+          }
+        >
+          <MessageSquareMore size={15} aria-hidden="true" />
+          Atividade
         </InternalLink>
         <InternalLink
           href="/agents"
@@ -154,11 +173,13 @@ export function WorkspaceTopbar({
   const finalLabel =
     route.kind === "home"
       ? "Visão geral"
-      : route.kind === "agents"
-        ? "Agentes"
-        : route.kind === "attention"
-          ? "Atenção"
-          : (mission?.title ?? project?.name ?? "Página não encontrada");
+      : route.kind === "activity"
+        ? "Atividade"
+        : route.kind === "agents"
+          ? "Agentes"
+          : route.kind === "attention"
+            ? "Atenção"
+            : (mission?.title ?? project?.name ?? "Página não encontrada");
 
   return (
     <header className="workspace-topbar">

@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import type {
   AgentSummary,
+  ChannelSummary,
   CockpitState,
   Dispatch,
   DispatchReceiptStatus,
@@ -24,7 +25,11 @@ import type {
   MissionStatus,
   Project,
 } from "../domain";
-import { Composer, type ComposerSubmission } from "./Composer";
+import {
+  Composer,
+  type ComposerDestination,
+  type ComposerSubmission,
+} from "./Composer";
 import {
   DispatchSpine,
   type DispatchSpineItem,
@@ -35,7 +40,13 @@ import { EmptyState, StateBadge } from "./primitives";
 import { updateSearchParam } from "./router";
 import type { CockpitMode, MissionViewMode } from "./Shell";
 import { missionStatusLabel, missionStatusTone } from "./status";
-import { ConversationHeading, Timeline, type TimelineEntry } from "./Timeline";
+import {
+  ConversationHeading,
+  messagesToTimelineEntries,
+  Timeline,
+  timelineEntryHasMedia,
+  type TimelineEntry,
+} from "./Timeline";
 import { SampleBanner } from "./Views";
 
 const receiptStage: Record<DispatchReceiptStatus, DispatchStage> = {
@@ -51,38 +62,6 @@ const receiptStage: Record<DispatchReceiptStatus, DispatchStage> = {
   blocked: "blocked",
   timed_out: "blocked",
 };
-
-function messageEntries(
-  messages: Message[],
-  agents: AgentSummary[],
-): TimelineEntry[] {
-  return [...messages]
-    .sort(
-      (left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt),
-    )
-    .map((message) => {
-      const agent = agents.find(
-        (candidate) =>
-          candidate.pubkey === message.authorPubkey ||
-          candidate.id === message.authorPubkey,
-      );
-      return {
-        id: message.id,
-        authorName: message.isMine ? "Isa" : message.authorName,
-        authorLabel: message.isMine ? "Orquestradora" : agent?.role,
-        avatarUrl: agent?.avatarUrl,
-        content: message.content,
-        createdAt: message.createdAt,
-        eventId: message.id,
-        role: message.isMine ? "isa" : "agent",
-        status: message.isMine ? "accepted" : "responded",
-        attachments: message.attachments.map((attachment) => ({
-          name: attachment.name,
-          url: attachment.url,
-        })),
-      } satisfies TimelineEntry;
-    });
-}
 
 function receiptActors(
   dispatch: Dispatch,
@@ -154,13 +133,19 @@ function spineItems(
 function MissionDetails({
   mission,
   agents,
+  channels,
   mode,
-  onLinkThread,
+  onLinkConversation,
 }: {
   mission: Mission;
   agents: AgentSummary[];
+  channels: ChannelSummary[];
   mode: CockpitMode;
-  onLinkThread: (threadId: string) => Promise<void>;
+  onLinkConversation: (input: {
+    channelId: string;
+    threadId: string;
+    label?: string;
+  }) => Promise<void>;
 }) {
   const missionAgents = mission.agentIds
     .map((id) => agents.find((agent) => agent.id === id || agent.pubkey === id))
@@ -215,11 +200,17 @@ function MissionDetails({
         <h3>
           <Link2 size={14} aria-hidden="true" /> Threads
         </h3>
-        {mission.threadIds.length > 0 ? (
+        {(mission.conversationRefs?.length ?? 0) > 0 ? (
           <ul className="thread-list">
-            {mission.threadIds.map((threadId) => (
-              <li title={threadId} key={threadId}>
-                #{compactId(threadId)}
+            {mission.conversationRefs?.map((conversation) => (
+              <li title={conversation.rootEventId} key={conversation.id}>
+                <strong>{conversation.label || "Conversa"}</strong>
+                <span>
+                  canal {compactId(conversation.channelId)}
+                  {conversation.rootEventId
+                    ? ` · thread #${compactId(conversation.rootEventId)}`
+                    : ""}
+                </span>
               </li>
             ))}
           </ul>
@@ -227,7 +218,11 @@ function MissionDetails({
           <p>A primeira mensagem cria e vincula a raiz.</p>
         )}
         {mode === "operator" && !mission.isSample ? (
-          <ThreadLinkForm onLinkThread={onLinkThread} />
+          <ThreadLinkForm
+            mission={mission}
+            channels={channels}
+            onLinkConversation={onLinkConversation}
+          />
         ) : null}
       </section>
     </div>
@@ -235,11 +230,23 @@ function MissionDetails({
 }
 
 function ThreadLinkForm({
-  onLinkThread,
+  mission,
+  channels,
+  onLinkConversation,
 }: {
-  onLinkThread: (threadId: string) => Promise<void>;
+  mission: Mission;
+  channels: ChannelSummary[];
+  onLinkConversation: (input: {
+    channelId: string;
+    threadId: string;
+    label?: string;
+  }) => Promise<void>;
 }) {
   const [threadId, setThreadId] = useState("");
+  const [channelId, setChannelId] = useState(
+    mission.channelId ?? channels[0]?.id ?? "",
+  );
+  const [label, setLabel] = useState("");
   const [status, setStatus] = useState<string>();
   const [saving, setSaving] = useState(false);
 
@@ -250,11 +257,20 @@ function ThreadLinkForm({
       setStatus("Use o event ID completo de 64 caracteres.");
       return;
     }
+    if (!channelId) {
+      setStatus("Escolha o canal ou DM desta thread.");
+      return;
+    }
     setSaving(true);
     setStatus(undefined);
     try {
-      await onLinkThread(value);
+      await onLinkConversation({
+        channelId,
+        threadId: value,
+        label: label.trim() || undefined,
+      });
       setThreadId("");
+      setLabel("");
       setStatus("Thread vinculada.");
     } catch (error) {
       setStatus(
@@ -268,12 +284,34 @@ function ThreadLinkForm({
   return (
     <form className="thread-link-form" onSubmit={(event) => void submit(event)}>
       <label>
-        <span>Vincular thread existente</span>
+        <span>Canal ou DM</span>
+        <select
+          value={channelId}
+          onChange={(event) => setChannelId(event.target.value)}
+        >
+          <option value="">Escolha o destino</option>
+          {channels.map((channel) => (
+            <option value={channel.id} key={channel.id}>
+              {channel.name} · {compactId(channel.id)}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        <span>Event ID da raiz</span>
         <input
           value={threadId}
           onChange={(event) => setThreadId(event.target.value)}
           placeholder="Event ID da raiz"
           spellCheck={false}
+        />
+      </label>
+      <label>
+        <span>Nome nesta missão</span>
+        <input
+          value={label}
+          onChange={(event) => setLabel(event.target.value)}
+          placeholder="Ex.: Honey · pesquisa"
         />
       </label>
       <button
@@ -407,11 +445,98 @@ function HandoffQueue({
   );
 }
 
+type ConversationFilter = "all" | "media" | string;
+
+function ConversationNavigator({
+  entries,
+  activeFilter,
+  onFilter,
+}: {
+  entries: TimelineEntry[];
+  activeFilter: ConversationFilter;
+  onFilter: (filter: ConversationFilter) => void;
+}) {
+  const participantMap = new Map<
+    string,
+    { name: string; label?: string; avatarUrl?: string; count: number }
+  >();
+  for (const entry of entries) {
+    const key = entry.role === "isa" ? "isa" : entry.authorPubkey;
+    if (!key) continue;
+    const current = participantMap.get(key);
+    participantMap.set(key, {
+      name: entry.authorName,
+      label: entry.authorLabel,
+      avatarUrl: entry.avatarUrl,
+      count: (current?.count ?? 0) + 1,
+    });
+  }
+  const participants = [...participantMap.entries()].sort((left, right) => {
+    if (left[0] === "isa") return -1;
+    if (right[0] === "isa") return 1;
+    return right[1].count - left[1].count;
+  });
+  const mediaCount = entries.filter(timelineEntryHasMedia).length;
+
+  return (
+    <section
+      className="conversation-navigator"
+      aria-label="Conversas por agente"
+    >
+      <header>
+        <strong>Conversas</strong>
+        <span>{participants.length} vozes</span>
+      </header>
+      <button
+        type="button"
+        className={activeFilter === "all" ? "is-active" : undefined}
+        aria-pressed={activeFilter === "all"}
+        onClick={() => onFilter("all")}
+      >
+        <span className="conversation-navigator__all">Todas as falas</span>
+        <small>{entries.length}</small>
+      </button>
+      {participants.map(([key, participant]) => (
+        <button
+          type="button"
+          className={activeFilter === key ? "is-active" : undefined}
+          aria-pressed={activeFilter === key}
+          onClick={() => onFilter(key)}
+          key={key}
+        >
+          <span className="conversation-navigator__person">
+            <span className="conversation-navigator__dot" aria-hidden="true" />
+            <span>
+              <strong>{participant.name}</strong>
+              <small>{participant.label}</small>
+            </span>
+          </span>
+          <small>{participant.count}</small>
+        </button>
+      ))}
+      {mediaCount > 0 ? (
+        <button
+          type="button"
+          className={activeFilter === "media" ? "is-active" : undefined}
+          aria-pressed={activeFilter === "media"}
+          onClick={() => onFilter("media")}
+        >
+          <span className="conversation-navigator__all">
+            Imagens e arquivos
+          </span>
+          <small>{mediaCount}</small>
+        </button>
+      ) : null}
+    </section>
+  );
+}
+
 export function MissionWorkspace({
   state,
   mission,
   project,
   agents,
+  channels,
   messages,
   messageLoading,
   messageError,
@@ -421,12 +546,13 @@ export function MissionWorkspace({
   saving,
   onSend,
   onStatusChange,
-  onLinkThread,
+  onLinkConversation,
 }: {
   state: CockpitState;
   mission: Mission;
   project: Project;
   agents: AgentSummary[];
+  channels: ChannelSummary[];
   messages: Message[];
   messageLoading: boolean;
   messageError?: string;
@@ -436,16 +562,41 @@ export function MissionWorkspace({
   saving: boolean;
   onSend: (submission: ComposerSubmission) => Promise<void>;
   onStatusChange: (status: MissionStatus) => Promise<void>;
-  onLinkThread: (threadId: string) => Promise<void>;
+  onLinkConversation: (input: {
+    channelId: string;
+    threadId: string;
+    label?: string;
+  }) => Promise<void>;
 }) {
   const [handoffDraft, setHandoffDraft] = useState<PendingHandoff>();
+  const [conversationFilter, setConversationFilter] =
+    useState<ConversationFilter>("all");
 
   const dispatches = mission.dispatchIds
     .map((id) => state.dispatches.find((dispatch) => dispatch.id === id))
     .filter((dispatch): dispatch is Dispatch => Boolean(dispatch));
   const chain = spineItems(dispatches, agents);
   const pendingHandoffs = findPendingHandoffs(dispatches, agents);
-  const entries = messageEntries(messages, agents);
+  const entries = messagesToTimelineEntries(messages, agents);
+  const visibleEntries = entries.filter((entry) => {
+    if (conversationFilter === "all") return true;
+    if (conversationFilter === "media") return timelineEntryHasMedia(entry);
+    if (conversationFilter === "isa") return entry.role === "isa";
+    return (
+      entry.authorPubkey === conversationFilter ||
+      entry.mentions?.some((mention) => mention.pubkey === conversationFilter)
+    );
+  });
+  const activeFilterLabel =
+    conversationFilter === "all"
+      ? "Toda a missão"
+      : conversationFilter === "media"
+        ? "Artefatos"
+        : (entries.find(
+            (entry) =>
+              entry.authorPubkey === conversationFilter ||
+              (conversationFilter === "isa" && entry.role === "isa"),
+          )?.authorName ?? "Conversa selecionada");
   const missionAgents =
     mission.agentIds.length > 0
       ? agents.filter(
@@ -454,11 +605,62 @@ export function MissionWorkspace({
             mission.agentIds.includes(agent.pubkey),
         )
       : agents;
-  const channelLabel = mission.channelId
-    ? `canal ${compactId(mission.channelId)}`
-    : "sem canal vinculado";
+  const linkedDestinations: ComposerDestination[] =
+    mission.conversationRefs?.map((conversation) => {
+      const channel = channels.find(
+        (candidate) => candidate.id === conversation.channelId,
+      );
+      return {
+        id: conversation.id,
+        channelId: conversation.channelId,
+        replyTo: conversation.rootEventId,
+        label:
+          conversation.label ||
+          `${channel?.name ?? "Conversa"}${
+            conversation.rootEventId
+              ? ` · thread #${compactId(conversation.rootEventId)}`
+              : ""
+          }`,
+      };
+    }) ?? [];
+  const newThreadDestinations: ComposerDestination[] = mission.channelId
+    ? [
+        {
+          id: `${mission.channelId}:new-thread`,
+          channelId: mission.channelId,
+          label: `Nova thread · ${
+            channels.find((channel) => channel.id === mission.channelId)
+              ?.name ?? `canal ${compactId(mission.channelId)}`
+          }`,
+        },
+      ]
+    : [];
+  const conversationDestinations: ComposerDestination[] = [
+    ...newThreadDestinations,
+    ...linkedDestinations,
+  ];
+  const channelLabel =
+    conversationDestinations.length === 0
+      ? "sem conversa vinculada"
+      : conversationDestinations.length === 1
+        ? conversationDestinations[0].label
+        : `${conversationDestinations.length} conversas vinculadas`;
+  const focusedAgentId =
+    handoffDraft?.agent.pubkey ||
+    handoffDraft?.agent.id ||
+    (conversationFilter !== "all" &&
+    conversationFilter !== "media" &&
+    conversationFilter !== "isa"
+      ? conversationFilter
+      : undefined);
+  const preferredDestinationId = mission.conversationRefs?.find(
+    (conversation) =>
+      focusedAgentId && conversation.agentIds.includes(focusedAgentId),
+  )?.id;
   const canOperate =
-    mode === "operator" && !mission.isSample && Boolean(mission.channelId);
+    mode === "operator" &&
+    !mission.isSample &&
+    conversationDestinations.length > 0;
 
   function prepareHandoff(item: PendingHandoff) {
     setHandoffDraft(item);
@@ -520,14 +722,18 @@ export function MissionWorkspace({
       {view === "conversation" ? (
         <div className="mission-grid">
           <section className="conversation-pane">
-            <ConversationHeading count={entries.length} />
+            <ConversationHeading
+              count={visibleEntries.length}
+              total={entries.length}
+              label={activeFilterLabel}
+            />
             {messageLoading && entries.length === 0 ? (
               <div className="empty-state">
                 <Radio className="spin" size={20} aria-hidden="true" />
                 <p>Lendo as threads no Buzz…</p>
               </div>
             ) : (
-              <Timeline entries={entries} />
+              <Timeline entries={visibleEntries} />
             )}
             {mode === "operator" ? (
               <div className="composer-wrap">
@@ -554,7 +760,8 @@ export function MissionWorkspace({
                     name: agent.name,
                     role: agent.role,
                   }))}
-                  destination={channelLabel}
+                  destinations={conversationDestinations}
+                  preferredDestinationId={preferredDestinationId}
                   preferredAgentPubkey={
                     handoffDraft?.agent.pubkey || handoffDraft?.agent.id
                   }
@@ -569,9 +776,9 @@ export function MissionWorkspace({
                     setHandoffDraft(undefined);
                   }}
                 />
-                {!mission.channelId ? (
+                {conversationDestinations.length === 0 ? (
                   <p className="operator-note">
-                    Vincule um canal à missão antes de enviar.
+                    Vincule um canal ou uma thread à missão antes de enviar.
                   </p>
                 ) : null}
                 {mission.isSample ? (
@@ -584,18 +791,32 @@ export function MissionWorkspace({
           </section>
           <aside className="chain-pane" aria-label="Chain da missão">
             <header className="chain-pane__heading">
-              <strong>Dispatch spine</strong>
+              <strong>Acompanhar</strong>
               <span>
                 {dispatches.length}/{mission.limits.maxDispatches}
               </span>
             </header>
+            <ConversationNavigator
+              entries={entries}
+              activeFilter={conversationFilter}
+              onFilter={setConversationFilter}
+            />
             <HandoffQueue
               items={pendingHandoffs}
               mode={mode}
               onPrepare={prepareHandoff}
             />
             <div className="chain-pane__body">
-              <DispatchSpine items={chain} />
+              <div className="chain-pane__subheading">
+                <strong>Chain recente</strong>
+                <button
+                  type="button"
+                  onClick={() => updateSearchParam("view", "chain")}
+                >
+                  Ver completa
+                </button>
+              </div>
+              <DispatchSpine items={chain.slice(-5)} />
             </div>
           </aside>
         </div>
@@ -628,8 +849,9 @@ export function MissionWorkspace({
             <MissionDetails
               mission={mission}
               agents={agents}
+              channels={channels}
               mode={mode}
-              onLinkThread={onLinkThread}
+              onLinkConversation={onLinkConversation}
             />
             <HandoffQueue
               items={pendingHandoffs}

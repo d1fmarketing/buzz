@@ -13,7 +13,7 @@ import {
   createProject,
   detectExplicitHandoff,
   guardMissionDispatch,
-  linkThread,
+  linkConversation,
   updateMission,
   upsertDispatch,
   type AgentSummary,
@@ -42,6 +42,7 @@ import {
 import { navigate, useRouteLocation } from "./ui/router";
 import {
   AgentsView,
+  ActivityView,
   AttentionView,
   HomeView,
   NotFoundView,
@@ -66,6 +67,7 @@ function decodePart(value: string | undefined): string | undefined {
 
 function routeFromPath(pathname: string): RouteDescriptor {
   if (pathname === "/") return { kind: "home" };
+  if (pathname === "/activity") return { kind: "activity" };
   if (pathname === "/agents") return { kind: "agents" };
   if (pathname === "/attention") return { kind: "attention" };
 
@@ -97,6 +99,32 @@ function errorMessage(error: unknown): string {
   return error instanceof Error
     ? error.message
     : "O adaptador local não concluiu a operação.";
+}
+
+async function mapSettledWithLimit<T, R>(
+  values: T[],
+  concurrency: number,
+  worker: (value: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results = new Array<PromiseSettledResult<R>>(values.length);
+  let cursor = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+      while (cursor < values.length) {
+        const index = cursor;
+        cursor += 1;
+        try {
+          results[index] = {
+            status: "fulfilled",
+            value: await worker(values[index]),
+          };
+        } catch (reason) {
+          results[index] = { status: "rejected", reason };
+        }
+      }
+    }),
+  );
+  return results;
 }
 
 function operationalPrompt(
@@ -228,10 +256,13 @@ export default function App() {
   >([]);
   const [liveAgents, setLiveAgents] = useState<AgentSummary[]>([]);
   const [liveMessages, setLiveMessages] = useState<Message[]>([]);
+  const [activityMessages, setActivityMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [messageLoading, setMessageLoading] = useState(false);
   const [messageError, setMessageError] = useState<string>();
+  const [activityError, setActivityError] = useState<string>();
+  const [activityLoading, setActivityLoading] = useState(false);
   const [fatalError, setFatalError] = useState<string>();
   const [saveError, setSaveError] = useState<string>();
   const [saving, setSaving] = useState(false);
@@ -281,12 +312,16 @@ export default function App() {
       );
 
       if (agentsResult.status === "fulfilled") {
-        const normalizedAgents = mergeFeedActivity(
-          normalizeAgentsResponse(agentsResult.value),
-          feedResult.status === "fulfilled"
-            ? normalizeMessagesResponse(feedResult.value)
-            : [],
+        const baseAgents = normalizeAgentsResponse(agentsResult.value);
+        const authorNames = Object.fromEntries(
+          baseAgents.map((agent) => [agent.pubkey, agent.name]),
         );
+        const normalizedFeed =
+          feedResult.status === "fulfilled"
+            ? normalizeMessagesResponse(feedResult.value, { authorNames })
+            : [];
+        setActivityMessages(normalizedFeed);
+        const normalizedAgents = mergeFeedActivity(baseAgents, normalizedFeed);
         const pubkeys = normalizedAgents
           .map((agent) => agent.pubkey)
           .filter(Boolean);
@@ -303,6 +338,11 @@ export default function App() {
         }
       } else {
         setLiveAgents([]);
+        setActivityMessages(
+          feedResult.status === "fulfilled"
+            ? normalizeMessagesResponse(feedResult.value)
+            : [],
+        );
       }
     } catch (error) {
       setHealth(OFFLINE_HEALTH);
@@ -316,6 +356,110 @@ export default function App() {
   useEffect(() => {
     void loadCockpit(true);
   }, [loadCockpit]);
+
+  const loadActivityFeed = useCallback(
+    async (includeHistory = false) => {
+      setActivityLoading(true);
+      setActivityError(undefined);
+      try {
+        const authorNames = Object.fromEntries(
+          effectiveAgents.map((agent) => [agent.pubkey, agent.name]),
+        );
+        const feedResult = await cockpitApi
+          .feed(50)
+          .then((value) => ({ status: "fulfilled" as const, value }))
+          .catch((reason) => ({ status: "rejected" as const, reason }));
+        const historyResults = includeHistory
+          ? await mapSettledWithLimit(channels, 5, async (channel) => ({
+              channel,
+              value: await cockpitApi.messages(channel.id, 25),
+            }))
+          : [];
+        const historyMessages = historyResults.flatMap((result) =>
+          result.status === "fulfilled"
+            ? normalizeMessagesResponse(result.value.value, {
+                channelId: result.value.channel.id,
+                authorNames,
+              })
+            : [],
+        );
+        const feedMessages =
+          feedResult.status === "fulfilled"
+            ? normalizeMessagesResponse(feedResult.value, { authorNames })
+            : [];
+        if (feedResult.status === "rejected" && historyMessages.length === 0) {
+          throw feedResult.reason;
+        }
+        setActivityMessages((current) => {
+          const combined = includeHistory
+            ? [...historyMessages, ...feedMessages]
+            : [...current, ...feedMessages];
+          return [
+            ...new Map(
+              combined.map((message) => [message.id, message]),
+            ).values(),
+          ]
+            .sort((left, right) => {
+              const time =
+                Date.parse(left.createdAt) - Date.parse(right.createdAt);
+              return time === 0 ? left.id.localeCompare(right.id) : time;
+            })
+            .slice(-300);
+        });
+        const failedChannels = historyResults.filter(
+          (result) => result.status === "rejected",
+        ).length;
+        if (failedChannels > 0 || feedResult.status === "rejected") {
+          const details = [];
+          if (failedChannels > 0) {
+            details.push(
+              `${failedChannels} de ${channels.length} conversas não responderam`,
+            );
+          }
+          if (feedResult.status === "rejected") {
+            details.push("o feed de menções não respondeu");
+          }
+          setActivityError(
+            `${details.join("; ")}. O restante continua visível.`,
+          );
+        }
+      } catch (error) {
+        setActivityError(errorMessage(error));
+      } finally {
+        setActivityLoading(false);
+      }
+    },
+    [channels, effectiveAgents],
+  );
+
+  useEffect(() => {
+    if (route.kind !== "activity" || loading) return;
+    void loadActivityFeed(true);
+    const feedInterval = window.setInterval(
+      () => void loadActivityFeed(false),
+      15_000,
+    );
+    const historyInterval = window.setInterval(
+      () => void loadActivityFeed(true),
+      60_000,
+    );
+    return () => {
+      window.clearInterval(feedInterval);
+      window.clearInterval(historyInterval);
+    };
+  }, [loadActivityFeed, loading, route.kind]);
+
+  useEffect(() => {
+    if (
+      state?.starter &&
+      route.kind === "mission" &&
+      currentMission?.isSample
+    ) {
+      navigate(`/activity${mode === "operator" ? "?mode=operator" : ""}`, {
+        replace: true,
+      });
+    }
+  }, [currentMission, mode, route.kind, state?.starter]);
 
   const persistState = useCallback(
     async (nextState: CockpitState, previousState?: CockpitState) => {
@@ -360,15 +504,26 @@ export default function App() {
 
         for (const dispatch of missionDispatches) {
           if (!dispatch || dispatch.responseEventId) continue;
-          const response = messages.find(
-            (message) =>
-              message.authorPubkey === dispatch.agentId &&
-              message.id !== dispatch.eventId &&
-              (message.replyToId === dispatch.eventId ||
-                message.rootId === dispatch.eventId ||
-                (Boolean(dispatch.threadId) &&
-                  message.threadId === dispatch.threadId)),
-          );
+          const response = messages.find((message) => {
+            if (
+              message.authorPubkey !== dispatch.agentId ||
+              message.id === dispatch.eventId
+            ) {
+              return false;
+            }
+            if (
+              message.replyToId === dispatch.eventId ||
+              message.rootId === dispatch.eventId
+            ) {
+              return true;
+            }
+            return Boolean(
+              dispatch.threadId &&
+                message.threadId === dispatch.threadId &&
+                Date.parse(message.createdAt) >=
+                  Date.parse(dispatch.createdAt) - 1_000,
+            );
+          });
           if (!response) continue;
 
           const receipts: DispatchReceipt[] = [
@@ -464,7 +619,29 @@ export default function App() {
       setMessageError(undefined);
       return;
     }
-    if (!currentMission.channelId) {
+    const conversationRefs =
+      currentMission.conversationRefs &&
+      currentMission.conversationRefs.length > 0
+        ? currentMission.conversationRefs
+        : currentMission.channelId
+          ? currentMission.threadIds.length > 0
+            ? currentMission.threadIds.map((threadId) => ({
+                id: `${currentMission.channelId}:${threadId}`,
+                channelId: currentMission.channelId ?? "",
+                rootEventId: threadId,
+                agentIds: [],
+                linkedAt: currentMission.updatedAt,
+              }))
+            : [
+                {
+                  id: `${currentMission.channelId}:channel-root`,
+                  channelId: currentMission.channelId,
+                  agentIds: [],
+                  linkedAt: currentMission.updatedAt,
+                },
+              ]
+          : [];
+    if (conversationRefs.length === 0) {
       setLiveMessages([]);
       setMessageError(undefined);
       return;
@@ -476,28 +653,34 @@ export default function App() {
       const authorNames = Object.fromEntries(
         effectiveAgents.map((agent) => [agent.pubkey, agent.name]),
       );
-      let normalized: Message[];
-      if (currentMission.threadIds.length > 0) {
-        const threadResults = await Promise.allSettled(
-          currentMission.threadIds.map((threadId) =>
-            cockpitApi.thread(currentMission.channelId ?? "", threadId),
-          ),
-        );
-        normalized = threadResults.flatMap((result) =>
-          result.status === "fulfilled"
-            ? normalizeMessagesResponse(result.value, {
-                channelId: currentMission.channelId,
-                authorNames,
-              })
-            : [],
-        );
-      } else {
-        normalized = normalizeMessagesResponse(
-          await cockpitApi.messages(currentMission.channelId),
-          {
-            channelId: currentMission.channelId,
-            authorNames,
-          },
+      const conversationResults = await Promise.allSettled(
+        conversationRefs.map(async (conversation) => ({
+          conversation,
+          raw: conversation.rootEventId
+            ? await cockpitApi.thread(
+                conversation.channelId,
+                conversation.rootEventId,
+              )
+            : await cockpitApi.messages(conversation.channelId, 200),
+        })),
+      );
+      const failedConversations = conversationResults.filter(
+        (result) => result.status === "rejected",
+      ).length;
+      let normalized = conversationResults.flatMap((result) =>
+        result.status === "fulfilled"
+          ? normalizeMessagesResponse(result.value.raw, {
+              channelId: result.value.conversation.channelId,
+              threadId: result.value.conversation.rootEventId,
+              authorNames,
+            })
+          : [],
+      );
+      if (failedConversations > 0) {
+        setMessageError(
+          `${failedConversations} conversa${failedConversations === 1 ? "" : "s"} não pôde${
+            failedConversations === 1 ? "" : "ram"
+          } ser lida; as demais continuam visíveis.`,
         );
       }
       const ownEventIds = new Set(
@@ -515,7 +698,10 @@ export default function App() {
       );
       const unique = [
         ...new Map(normalized.map((message) => [message.id, message])).values(),
-      ];
+      ].sort((left, right) => {
+        const time = Date.parse(left.createdAt) - Date.parse(right.createdAt);
+        return time === 0 ? left.id.localeCompare(right.id) : time;
+      });
       setLiveMessages(unique);
       reconcileResponses(unique);
     } catch (error) {
@@ -624,16 +810,49 @@ export default function App() {
     await persistState(next, state);
   }
 
-  async function handleLinkThread(threadId: string) {
+  async function handleLinkConversation(input: {
+    channelId: string;
+    threadId: string;
+    label?: string;
+  }) {
     if (!state || !currentMission) return;
-    const next = linkThread(state, currentMission.id, threadId);
+    const next = linkConversation(state, currentMission.id, {
+      channelId: input.channelId,
+      rootEventId: input.threadId,
+      label: input.label,
+      agentIds: [],
+    });
     await persistState(next, state);
   }
 
   async function handleSend(submission: ComposerSubmission) {
-    if (!state || !currentMission?.channelId) {
-      throw new Error("A missão precisa de um canal do Buzz antes do envio.");
+    if (!state || !currentMission) {
+      throw new Error(
+        "A missão precisa de uma conversa do Buzz antes do envio.",
+      );
     }
+    const startsNewThread =
+      Boolean(currentMission.channelId) &&
+      submission.destinationId === `${currentMission.channelId}:new-thread` &&
+      submission.channelId === currentMission.channelId &&
+      !submission.replyTo;
+    const destination = startsNewThread
+      ? {
+          id: submission.destinationId,
+          channelId: submission.channelId,
+          rootEventId: undefined,
+        }
+      : currentMission.conversationRefs?.find(
+          (conversation) => conversation.id === submission.destinationId,
+        );
+    if (
+      !destination ||
+      destination.channelId !== submission.channelId ||
+      (destination.rootEventId ?? undefined) !== submission.replyTo
+    ) {
+      throw new Error("A conversa escolhida não pertence a esta missão.");
+    }
+    const destinationChannelId = destination.channelId;
     const agent = effectiveAgents.find(
       (candidate) =>
         candidate.pubkey === submission.agentPubkey ||
@@ -670,6 +889,7 @@ export default function App() {
       retryCount: 0,
       proposedAgentIds: [],
       parentDispatchId: submission.parentDispatchId,
+      channelId: destinationChannelId,
     });
     next = updateMission(next, currentMission.id, {
       status: "running",
@@ -686,9 +906,10 @@ export default function App() {
         submission.files.map(fileToAttachment),
       );
       const rawReceipt = await cockpitApi.sendMessage({
-        channelId: currentMission.channelId,
+        channelId: destinationChannelId,
         content: sendContent,
         mentions: [agent.pubkey || agent.id],
+        replyTo: submission.replyTo,
         attachments,
       });
       const receipt = normalizeWriteReceipt(rawReceipt);
@@ -706,7 +927,17 @@ export default function App() {
           at: new Date().toISOString(),
           eventId: receipt.eventId,
         });
-        delivered = linkThread(delivered, currentMission.id, receipt.eventId);
+        const conversationRoot = submission.replyTo ?? receipt.eventId;
+        delivered = linkConversation(delivered, currentMission.id, {
+          channelId: destinationChannelId,
+          rootEventId: conversationRoot,
+          label:
+            currentMission.conversationRefs?.find(
+              (conversation) => conversation.id === submission.destinationId,
+            )?.label ?? agent.name,
+          agentIds: [agent.pubkey || agent.id],
+          dispatchId,
+        });
         const acceptedDispatch = delivered.dispatches.find(
           (dispatch) => dispatch.id === dispatchId,
         );
@@ -719,7 +950,8 @@ export default function App() {
           ...acceptedDispatch,
           status: "relay_accepted",
           eventId: receipt.eventId,
-          threadId: receipt.eventId,
+          channelId: destinationChannelId,
+          threadId: conversationRoot,
         });
         if (submission.parentDispatchId) {
           const handoffTime = new Date().toISOString();
@@ -844,6 +1076,18 @@ export default function App() {
         onCreateProject={handleCreateProject}
       />
     );
+  } else if (route.kind === "activity") {
+    content = (
+      <ActivityView
+        messages={activityMessages}
+        agents={effectiveAgents}
+        channels={channels}
+        state={state}
+        loading={activityLoading}
+        error={activityError}
+        selectedAgentPubkey={location.search.get("agent") ?? undefined}
+      />
+    );
   } else if (route.kind === "project" && currentProject) {
     content = (
       <ProjectView
@@ -867,6 +1111,7 @@ export default function App() {
         mission={currentMission}
         project={currentProject}
         agents={missionAgents}
+        channels={channels}
         messages={liveMessages}
         messageLoading={messageLoading}
         messageError={messageError}
@@ -876,7 +1121,7 @@ export default function App() {
         sending={sending}
         onSend={handleSend}
         onStatusChange={handleMissionStatus}
-        onLinkThread={handleLinkThread}
+        onLinkConversation={handleLinkConversation}
       />
     );
   } else if (route.kind === "agents") {

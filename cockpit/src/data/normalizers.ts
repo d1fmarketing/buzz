@@ -159,9 +159,11 @@ function parseImeta(
     id: hash ?? stableLocalId("attachment", `${url ?? ""}:${index}`),
     name: fields.get("name") ?? urlName ?? `Attachment ${index + 1}`,
     url,
+    thumbnailUrl: fields.get("thumb"),
     mimeType: fields.get("m"),
     size,
     sha256: hash,
+    dimensions: fields.get("dim"),
   };
 }
 
@@ -186,9 +188,11 @@ function normalizeAttachment(
     name:
       name ?? url?.split("/").pop()?.split("?")[0] ?? `Attachment ${index + 1}`,
     url,
+    thumbnailUrl: firstString(value, "thumbnailUrl", "thumbnail_url", "thumb"),
     mimeType: firstString(value, "mimeType", "mime_type", "type"),
     size: firstNumber(value, "size", "bytes"),
     sha256,
+    dimensions: firstString(value, "dimensions", "dim"),
   };
 }
 
@@ -289,7 +293,7 @@ export function normalizeMessagesResponse(
       if (!isRecord(value)) {
         return [];
       }
-      const content = asString(value.content) ?? "";
+      const content = typeof value.content === "string" ? value.content : "";
       const tags = normalizeTags(value.tags);
       const createdAt = toIsoTimestamp(
         value.created_at ?? value.createdAt ?? value.timestamp,
@@ -519,6 +523,56 @@ function normalizeMission(
   }
   const rawLimits = isRecord(value.limits) ? value.limits : {};
   const defaults = copyDefaultLimits();
+  const channelId = firstString(value, "channelId", "channel_id");
+  const threadIds = stringArray(value.threadIds ?? value.thread_ids);
+  const rawConversationRefs = Array.isArray(
+    value.conversationRefs ?? value.conversation_refs,
+  )
+    ? (value.conversationRefs ?? value.conversation_refs)
+    : [];
+  const conversationRefs = (rawConversationRefs as unknown[]).flatMap(
+    (conversation, index) => {
+      if (!isRecord(conversation)) return [];
+      const refChannelId = firstString(conversation, "channelId", "channel_id");
+      if (!refChannelId) return [];
+      const rootEventId = firstString(
+        conversation,
+        "rootEventId",
+        "root_event_id",
+      );
+      return [
+        {
+          id:
+            firstString(conversation, "id") ??
+            `${refChannelId}:${rootEventId ?? index}`,
+          channelId: refChannelId,
+          rootEventId,
+          label: firstString(conversation, "label", "name"),
+          agentIds: stringArray(
+            conversation.agentIds ?? conversation.agent_ids,
+          ),
+          linkedAt: toIsoTimestamp(
+            conversation.linkedAt ?? conversation.linked_at,
+            fallbackTime,
+          ),
+          dispatchId: firstString(conversation, "dispatchId", "dispatch_id"),
+        },
+      ];
+    },
+  );
+  if (conversationRefs.length === 0 && channelId) {
+    for (const threadId of threadIds) {
+      conversationRefs.push({
+        id: `${channelId}:${threadId}`,
+        channelId,
+        rootEventId: threadId,
+        label: undefined,
+        agentIds: [],
+        linkedAt: fallbackTime,
+        dispatchId: undefined,
+      });
+    }
+  }
   return {
     id,
     projectId,
@@ -526,8 +580,9 @@ function normalizeMission(
     objective: firstString(value, "objective") ?? "",
     brief: firstString(value, "brief") ?? "",
     status: enumValue(value.status, MISSION_STATUSES, "draft"),
-    channelId: firstString(value, "channelId", "channel_id"),
-    threadIds: stringArray(value.threadIds ?? value.thread_ids),
+    channelId,
+    threadIds,
+    conversationRefs,
     agentIds: stringArray(value.agentIds ?? value.agent_ids),
     dispatchIds: stringArray(value.dispatchIds ?? value.dispatch_ids),
     limits: {
@@ -640,6 +695,7 @@ function normalizeDispatch(
       "parentDispatchId",
       "parent_dispatch_id",
     ),
+    channelId: firstString(value, "channelId", "channel_id"),
     threadId: firstString(value, "threadId", "thread_id"),
     eventId: firstString(value, "eventId", "event_id"),
     responseEventId: firstString(value, "responseEventId", "response_event_id"),
