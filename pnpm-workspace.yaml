@@ -2,6 +2,7 @@ packages:
   - "desktop"
   - "web"
   - "admin-web"
+  - "cockpit"
 allowBuilds:
   esbuild: true
 overrides:
