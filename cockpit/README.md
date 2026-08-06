@@ -23,6 +23,10 @@ It never reads an OpenAI, Anthropic or other LLM API key.
 - existing-thread linking by root event ID;
 - model-change drafts sent to the original Buzz Desktop for owner review.
 
+Attachments follow the media formats accepted by the installed Buzz CLI:
+JPEG, PNG, GIF, WebP, and MP4. The composer filters unsupported files before
+they reach the relay.
+
 ## Run locally
 
 ```bash

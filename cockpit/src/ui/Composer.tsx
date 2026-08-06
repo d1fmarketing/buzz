@@ -1,6 +1,18 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { AtSign, File, LoaderCircle, Paperclip, Send, X } from "lucide-react";
 
+const BUZZ_ATTACHMENT_ACCEPT =
+  "image/jpeg,image/png,image/gif,image/webp,video/mp4";
+const BUZZ_ATTACHMENT_EXTENSION = /\.(?:jpe?g|png|gif|webp|mp4)$/i;
+const MAX_ATTACHMENTS = 20;
+
+function isSupportedBuzzAttachment(file: File) {
+  return (
+    BUZZ_ATTACHMENT_ACCEPT.split(",").includes(file.type) ||
+    BUZZ_ATTACHMENT_EXTENSION.test(file.name)
+  );
+}
+
 export interface ComposerAgent {
   pubkey: string;
   name: string;
@@ -152,12 +164,35 @@ export function Composer({
           ref={fileInputRef}
           className="sr-only"
           type="file"
+          accept={BUZZ_ATTACHMENT_ACCEPT}
           multiple
           onChange={(event) => {
-            setFiles((current) => [
-              ...current,
-              ...Array.from(event.target.files ?? []),
-            ]);
+            const selected = Array.from(event.target.files ?? []);
+            const supported = selected.filter(isSupportedBuzzAttachment);
+            const unsupported = selected.filter(
+              (file) => !isSupportedBuzzAttachment(file),
+            );
+            const availableSlots = Math.max(0, MAX_ATTACHMENTS - files.length);
+            const accepted = supported.slice(0, availableSlots);
+            const excessCount = supported.length - accepted.length;
+
+            setFiles((current) => [...current, ...accepted]);
+            if (unsupported.length > 0 || excessCount > 0) {
+              const reasons = [];
+              if (unsupported.length > 0) {
+                reasons.push(
+                  `formato não aceito: ${unsupported.map((file) => file.name).join(", ")}`,
+                );
+              }
+              if (excessCount > 0) {
+                reasons.push(`limite de ${MAX_ATTACHMENTS} anexos por envio`);
+              }
+              setLocalError(
+                `O Buzz envia JPEG, PNG, GIF, WebP e MP4; ${reasons.join("; ")}.`,
+              );
+            } else {
+              setLocalError(undefined);
+            }
             event.target.value = "";
           }}
         />
@@ -165,6 +200,7 @@ export function Composer({
           className="icon-button icon-button--label"
           type="button"
           disabled={disabled || sending}
+          title="JPEG, PNG, GIF, WebP ou MP4"
           onClick={() => fileInputRef.current?.click()}
         >
           <Paperclip size={15} aria-hidden="true" />
